@@ -101,7 +101,7 @@ func (g *Generator) buildOperation(
 			)
 		}
 
-		return "/api/v1/users/" + g.idSource.UserID(), nil, nil
+		return "/api/v1/users/" + g.idSource.User().PathID, nil, nil
 
 	case demo.OperationCreateUser:
 		body, err := generateJSONBody(
@@ -130,7 +130,7 @@ func (g *Generator) buildOperation(
 			return "", nil, err
 		}
 
-		return "/api/v1/users/" + g.idSource.UserID(), body, nil
+		return "/api/v1/users/" + g.idSource.User().PathID, body, nil
 
 	case demo.OperationDeleteUser:
 		if requestSize != demo.RequestSizeNone {
@@ -140,7 +140,7 @@ func (g *Generator) buildOperation(
 			)
 		}
 
-		return "/api/v1/users/" + g.idSource.UserID(), nil, nil
+		return "/api/v1/users/" + g.idSource.User().PathID, nil, nil
 
 	case demo.OperationGetOrders:
 		if requestSize != demo.RequestSizeNone {
@@ -160,13 +160,13 @@ func (g *Generator) buildOperation(
 			)
 		}
 
-		return "/api/v1/orders/" + g.idSource.OrderID(), nil, nil
+		return "/api/v1/orders/" + g.idSource.Order().PathID, nil, nil
 
 	case demo.OperationCreateOrder:
 		body, err := generateJSONBody(
 			requestSize.Bytes(),
 			map[string]any{
-				"customer_id": g.idSource.UserID(),
+				"customer_id": g.idSource.User().ID,
 				"currency":    "USD",
 				"total":       129900,
 			},
@@ -189,7 +189,7 @@ func (g *Generator) buildOperation(
 			return "", nil, err
 		}
 
-		return "/api/v1/orders/" + g.idSource.OrderID(), body, nil
+		return "/api/v1/orders/" + g.idSource.Order().PathID, body, nil
 
 	case demo.OperationDeleteOrder:
 		if requestSize != demo.RequestSizeNone {
@@ -199,7 +199,7 @@ func (g *Generator) buildOperation(
 			)
 		}
 
-		return "/api/v1/orders/" + g.idSource.OrderID(), nil, nil
+		return "/api/v1/orders/" + g.idSource.Order().PathID, nil, nil
 
 	default:
 		return "", nil, fmt.Errorf(

@@ -6,9 +6,19 @@ import (
 	"sync"
 )
 
+type UserRef struct {
+	PathID string
+	ID     string
+}
+
+type OrderRef struct {
+	PathID string
+	ID     string
+}
+
 type IDSource interface {
-	UserID() string
-	OrderID() string
+	User() UserRef
+	Order() OrderRef
 }
 
 type RandomIDSource struct {
@@ -22,16 +32,26 @@ func NewRandomIDSource(seed int64) *RandomIDSource {
 	}
 }
 
-func (s *RandomIDSource) UserID() string {
+func (s *RandomIDSource) User() UserRef {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return fmt.Sprintf("usr_%06d", s.rng.Intn(20)+1)
+	id := s.rng.Intn(20) + 1
+
+	return UserRef{
+		PathID: fmt.Sprintf("%d", id),
+		ID:     fmt.Sprintf("usr_%06d", id),
+	}
 }
 
-func (s *RandomIDSource) OrderID() string {
+func (s *RandomIDSource) Order() OrderRef {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return fmt.Sprintf("ord_%06d", s.rng.Intn(20)+1)
+	id := s.rng.Intn(20) + 1
+
+	return OrderRef{
+		PathID: fmt.Sprintf("%d", id),
+		ID:     fmt.Sprintf("ord_%06d", id),
+	}
 }

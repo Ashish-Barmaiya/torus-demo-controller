@@ -7,24 +7,25 @@ import (
 
 const defaultFiller = "torus-demo-request"
 
-type requestEnvelope struct {
-	Data    any    `json:"data"`
-	Payload string `json:"payload,omitempty"`
-}
-
 func generateJSONBody(target int64, data any) ([]byte, error) {
 	if target < 0 {
 		return nil, fmt.Errorf("request size must not be negative")
 	}
 
-	base := requestEnvelope{
-		Data: data,
+	base, ok := data.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("request body data must be an object")
+	}
+
+	bodyData := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		bodyData[key] = value
 	}
 
 	// 0b means: return a normal valid request body without
 	// requesting a specific size.
 	if target == 0 {
-		body, err := json.Marshal(base)
+		body, err := json.Marshal(bodyData)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request body: %w", err)
 		}
@@ -38,9 +39,9 @@ func generateJSONBody(target int64, data any) ([]byte, error) {
 	for low <= high {
 		mid := (low + high) / 2
 
-		base.Payload = makeFiller(mid)
+		bodyData["payload"] = makeFiller(mid)
 
-		body, err := json.Marshal(base)
+		body, err := json.Marshal(bodyData)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request body: %w", err)
 		}
@@ -65,9 +66,9 @@ func generateJSONBody(target int64, data any) ([]byte, error) {
 	end := min(int(target), high+4)
 
 	for fillerLength := start; fillerLength <= end; fillerLength++ {
-		base.Payload = makeFiller(fillerLength)
+		bodyData["payload"] = makeFiller(fillerLength)
 
-		body, err := json.Marshal(base)
+		body, err := json.Marshal(bodyData)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request body: %w", err)
 		}

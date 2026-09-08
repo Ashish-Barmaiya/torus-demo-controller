@@ -10,24 +10,34 @@ import (
 )
 
 type fixedIDSource struct {
-	userID  string
-	orderID string
+	userPathID  string
+	userID      string
+	orderPathID string
+	orderID     string
 }
 
-func (s fixedIDSource) UserID() string {
-	return s.userID
+func (s fixedIDSource) User() UserRef {
+	return UserRef{
+		PathID: s.userPathID,
+		ID:     s.userID,
+	}
 }
 
-func (s fixedIDSource) OrderID() string {
-	return s.orderID
+func (s fixedIDSource) Order() OrderRef {
+	return OrderRef{
+		PathID: s.orderPathID,
+		ID:     s.orderID,
+	}
 }
 
 func newTestGenerator() *Generator {
 	return NewGenerator(
 		"http://torus:8080",
 		fixedIDSource{
-			userID:  "usr_000005",
-			orderID: "ord_000007",
+			userPathID:  "5",
+			userID:      "usr_000005",
+			orderPathID: "7",
+			orderID:     "ord_000007",
 		},
 	)
 }
@@ -99,8 +109,8 @@ func TestBuildGetUser(t *testing.T) {
 		t.Fatalf("method = %q, want %q", req.Method, http.MethodGet)
 	}
 
-	if req.URL.Path != "/api/v1/users/usr_000005" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/users/5" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/users/5")
 	}
 }
 
@@ -164,8 +174,8 @@ func TestBuildUpdateUser(t *testing.T) {
 		t.Fatalf("method = %q, want %q", req.Method, http.MethodPatch)
 	}
 
-	if req.URL.Path != "/api/v1/users/usr_000005" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/users/5" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/users/5")
 	}
 }
 
@@ -184,8 +194,8 @@ func TestBuildDeleteUser(t *testing.T) {
 		t.Fatalf("method = %q, want %q", req.Method, http.MethodDelete)
 	}
 
-	if req.URL.Path != "/api/v1/users/usr_000005" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/users/5" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/users/5")
 	}
 }
 
@@ -220,8 +230,8 @@ func TestBuildGetOrder(t *testing.T) {
 		t.Fatalf("Build() error: %v", err)
 	}
 
-	if req.URL.Path != "/api/v1/orders/ord_000007" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/orders/7" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/orders/7")
 	}
 }
 
@@ -277,8 +287,8 @@ func TestBuildUpdateOrder(t *testing.T) {
 		t.Fatalf("method = %q, want %q", req.Method, http.MethodPatch)
 	}
 
-	if req.URL.Path != "/api/v1/orders/ord_000007" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/orders/7" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/orders/7")
 	}
 }
 
@@ -297,8 +307,61 @@ func TestBuildDeleteOrder(t *testing.T) {
 		t.Fatalf("method = %q, want %q", req.Method, http.MethodDelete)
 	}
 
-	if req.URL.Path != "/api/v1/orders/ord_000007" {
-		t.Fatalf("path = %q", req.URL.Path)
+	if req.URL.Path != "/api/v1/orders/7" {
+		t.Fatalf("path = %q, want %q", req.URL.Path, "/api/v1/orders/7")
+	}
+}
+
+func TestBuildBodySemantics(t *testing.T) {
+	bodyless := []demo.Operation{
+		demo.OperationGetUsers,
+		demo.OperationGetUser,
+		demo.OperationDeleteUser,
+		demo.OperationGetOrders,
+		demo.OperationGetOrder,
+		demo.OperationDeleteOrder,
+	}
+
+	for _, operation := range bodyless {
+		t.Run(string(operation), func(t *testing.T) {
+			req, err := newTestGenerator().Build(validScenario(operation.Service(), operation))
+			if err != nil {
+				t.Fatalf("Build() error: %v", err)
+			}
+
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			if len(body) != 0 {
+				t.Fatalf("body size = %d, want 0", len(body))
+			}
+
+			if got := req.Header.Get("Content-Type"); got != "" {
+				t.Fatalf("content type = %q, want empty", got)
+			}
+		})
+	}
+
+	bodyful := []demo.Operation{
+		demo.OperationCreateUser,
+		demo.OperationUpdateUser,
+		demo.OperationCreateOrder,
+		demo.OperationUpdateOrder,
+	}
+
+	for _, operation := range bodyful {
+		t.Run(string(operation), func(t *testing.T) {
+			req, err := newTestGenerator().Build(validScenario(operation.Service(), operation))
+			if err != nil {
+				t.Fatalf("Build() error: %v", err)
+			}
+
+			if got := req.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type = %q, want application/json", got)
+			}
+		})
 	}
 }
 
@@ -371,8 +434,10 @@ func TestBuildRejectsEmptyBaseURL(t *testing.T) {
 	generator := NewGenerator(
 		"",
 		fixedIDSource{
-			userID:  "usr_000005",
-			orderID: "ord_000007",
+			userPathID:  "5",
+			userID:      "usr_000005",
+			orderPathID: "7",
+			orderID:     "ord_000007",
 		},
 	)
 

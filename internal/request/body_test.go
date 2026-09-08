@@ -6,26 +6,53 @@ import (
 )
 
 func TestGenerateJSONBodyDefault(t *testing.T) {
-	body, err := generateJSONBody(
-		0,
-		map[string]any{
-			"name":  "Demo User",
-			"email": "demo.user@example.com",
-			"plan":  "pro",
+	tests := []struct {
+		name string
+		data map[string]any
+		keys []string
+	}{
+		{
+			name: "user",
+			data: map[string]any{
+				"name":  "Demo User",
+				"email": "demo.user@example.com",
+				"plan":  "pro",
+			},
+			keys: []string{"name", "email", "plan"},
 		},
-	)
-	if err != nil {
-		t.Fatalf("generateJSONBody() error: %v", err)
+		{
+			name: "order",
+			data: map[string]any{
+				"customer_id": "usr_000005",
+				"currency":    "USD",
+				"total":       129900,
+			},
+			keys: []string{"customer_id", "currency", "total"},
+		},
 	}
 
-	if len(body) == 0 {
-		t.Fatal("expected non-empty body")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := generateJSONBody(0, tt.data)
+			if err != nil {
+				t.Fatalf("generateJSONBody() error: %v", err)
+			}
 
-	var decoded map[string]any
+			if len(body) == 0 {
+				t.Fatal("expected non-empty body")
+			}
 
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+			var decoded map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("invalid JSON: %v", err)
+			}
+
+			for _, key := range tt.keys {
+				if _, ok := decoded[key]; !ok {
+					t.Fatalf("request body missing %q", key)
+				}
+			}
+		})
 	}
 }
 
@@ -65,9 +92,9 @@ func TestGenerateJSONBodyExactSize(t *testing.T) {
 			body, err := generateJSONBody(
 				tt.target,
 				map[string]any{
-					"name":  "Demo User",
-					"email": "demo.user@example.com",
-					"plan":  "pro",
+					"customer_id": "usr_000005",
+					"currency":    "USD",
+					"total":       129900,
 				},
 			)
 			if err != nil {
@@ -88,8 +115,10 @@ func TestGenerateJSONBodyExactSize(t *testing.T) {
 				t.Fatalf("invalid JSON: %v", err)
 			}
 
-			if _, ok := decoded["data"]; !ok {
-				t.Fatal("response body missing data field")
+			for _, key := range []string{"customer_id", "currency", "total"} {
+				if _, ok := decoded[key]; !ok {
+					t.Fatalf("request body missing %q", key)
+				}
 			}
 		})
 	}
