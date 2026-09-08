@@ -387,3 +387,118 @@ func TestBuildRejectsEmptyBaseURL(t *testing.T) {
 		t.Fatal("expected empty base URL to be rejected")
 	}
 }
+
+func TestBuildRequestSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation demo.Operation
+		size      demo.RequestSize
+		wantBytes int
+	}{
+		{
+			name:      "create user 1kb",
+			operation: demo.OperationCreateUser,
+			size:      demo.RequestSize1KB,
+			wantBytes: 1 << 10,
+		},
+		{
+			name:      "update user 64kb",
+			operation: demo.OperationUpdateUser,
+			size:      demo.RequestSize64KB,
+			wantBytes: 64 << 10,
+		},
+		{
+			name:      "create order 1mb",
+			operation: demo.OperationCreateOrder,
+			size:      demo.RequestSize1MB,
+			wantBytes: 1 << 20,
+		},
+		{
+			name:      "update order 4mb",
+			operation: demo.OperationUpdateOrder,
+			size:      demo.RequestSize4MB,
+			wantBytes: 4 << 20,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := demo.Scenario{
+				Service:      tt.operation.Service(),
+				Operation:    tt.operation,
+				Simulation:   demo.SimulationNormal,
+				RequestSize:  tt.size,
+				ResponseSize: demo.ResponseSizeNone,
+				RequestCount: 1,
+			}
+
+			req, err := newTestGenerator().Build(scenario)
+			if err != nil {
+				t.Fatalf("Build() error: %v", err)
+			}
+
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			if len(body) != tt.wantBytes {
+				t.Fatalf(
+					"body size = %d, want %d",
+					len(body),
+					tt.wantBytes,
+				)
+			}
+		})
+	}
+}
+
+func TestBuildRejectsRequestSizeForBodylessOperation(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation demo.Operation
+	}{
+		{
+			name:      "get user",
+			operation: demo.OperationGetUser,
+		},
+		{
+			name:      "get users",
+			operation: demo.OperationGetUsers,
+		},
+		{
+			name:      "delete user",
+			operation: demo.OperationDeleteUser,
+		},
+		{
+			name:      "get order",
+			operation: demo.OperationGetOrder,
+		},
+		{
+			name:      "get orders",
+			operation: demo.OperationGetOrders,
+		},
+		{
+			name:      "delete order",
+			operation: demo.OperationDeleteOrder,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := demo.Scenario{
+				Service:      tt.operation.Service(),
+				Operation:    tt.operation,
+				Simulation:   demo.SimulationNormal,
+				RequestSize:  demo.RequestSize1KB,
+				ResponseSize: demo.ResponseSizeNone,
+				RequestCount: 1,
+			}
+
+			_, err := newTestGenerator().Build(scenario)
+			if err == nil {
+				t.Fatal("expected request size to be rejected")
+			}
+		})
+	}
+}

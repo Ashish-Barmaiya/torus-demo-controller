@@ -140,6 +140,27 @@ func (s RequestSize) Valid() bool {
 	}
 }
 
+func (s RequestSize) Bytes() int64 {
+	switch s {
+	case RequestSizeNone:
+		return 0
+	case RequestSize1KB:
+		return 1 << 10
+	case RequestSize16KB:
+		return 16 << 10
+	case RequestSize64KB:
+		return 64 << 10
+	case RequestSize256KB:
+		return 256 << 10
+	case RequestSize1MB:
+		return 1 << 20
+	case RequestSize4MB:
+		return 4 << 20
+	default:
+		return 0
+	}
+}
+
 type ResponseSize string
 
 const (

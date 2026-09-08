@@ -2,7 +2,6 @@ package request
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -44,7 +43,10 @@ func (g *Generator) Build(scenario demo.Scenario) (*http.Request, error) {
 	}
 
 	method := scenario.Operation.Method()
-	path, body, err := g.buildOperation(scenario.Operation)
+	path, body, err := g.buildOperation(
+		scenario.Operation,
+		scenario.RequestSize,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -78,40 +80,125 @@ func (g *Generator) Build(scenario demo.Scenario) (*http.Request, error) {
 
 func (g *Generator) buildOperation(
 	operation demo.Operation,
+	requestSize demo.RequestSize,
 ) (string, []byte, error) {
 	switch operation {
 	case demo.OperationGetUsers:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/users", nil, nil
 
 	case demo.OperationGetUser:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/users/" + g.idSource.UserID(), nil, nil
 
 	case demo.OperationCreateUser:
-		return "/api/v1/users", g.createUserBody(), nil
+		body, err := generateJSONBody(
+			requestSize.Bytes(),
+			map[string]any{
+				"name":  "Demo User",
+				"email": "demo.user@example.com",
+				"plan":  "pro",
+			},
+		)
+		if err != nil {
+			return "", nil, err
+		}
+
+		return "/api/v1/users", body, nil
 
 	case demo.OperationUpdateUser:
-		return "/api/v1/users/" + g.idSource.UserID(),
-			g.updateUserBody(),
-			nil
+		body, err := generateJSONBody(
+			requestSize.Bytes(),
+			map[string]any{
+				"plan":   "enterprise",
+				"status": "active",
+			},
+		)
+		if err != nil {
+			return "", nil, err
+		}
+
+		return "/api/v1/users/" + g.idSource.UserID(), body, nil
 
 	case demo.OperationDeleteUser:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/users/" + g.idSource.UserID(), nil, nil
 
 	case demo.OperationGetOrders:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/orders", nil, nil
 
 	case demo.OperationGetOrder:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/orders/" + g.idSource.OrderID(), nil, nil
 
 	case demo.OperationCreateOrder:
-		return "/api/v1/orders", g.createOrderBody(), nil
+		body, err := generateJSONBody(
+			requestSize.Bytes(),
+			map[string]any{
+				"customer_id": g.idSource.UserID(),
+				"currency":    "USD",
+				"total":       129900,
+			},
+		)
+		if err != nil {
+			return "", nil, err
+		}
+
+		return "/api/v1/orders", body, nil
 
 	case demo.OperationUpdateOrder:
-		return "/api/v1/orders/" + g.idSource.OrderID(),
-			g.updateOrderBody(),
-			nil
+		body, err := generateJSONBody(
+			requestSize.Bytes(),
+			map[string]any{
+				"status": "processing",
+				"total":  149900,
+			},
+		)
+		if err != nil {
+			return "", nil, err
+		}
+
+		return "/api/v1/orders/" + g.idSource.OrderID(), body, nil
 
 	case demo.OperationDeleteOrder:
+		if requestSize != demo.RequestSizeNone {
+			return "", nil, fmt.Errorf(
+				"request size is not supported for %q",
+				operation,
+			)
+		}
+
 		return "/api/v1/orders/" + g.idSource.OrderID(), nil, nil
 
 	default:
@@ -120,51 +207,4 @@ func (g *Generator) buildOperation(
 			operation,
 		)
 	}
-}
-
-func (g *Generator) createUserBody() []byte {
-	body := map[string]any{
-		"name":  "Demo User",
-		"email": "demo.user@example.com",
-		"plan":  "pro",
-	}
-
-	return mustJSON(body)
-}
-
-func (g *Generator) updateUserBody() []byte {
-	body := map[string]any{
-		"plan":   "enterprise",
-		"status": "active",
-	}
-
-	return mustJSON(body)
-}
-
-func (g *Generator) createOrderBody() []byte {
-	body := map[string]any{
-		"customer_id": g.idSource.UserID(),
-		"currency":    "USD",
-		"total":       129900,
-	}
-
-	return mustJSON(body)
-}
-
-func (g *Generator) updateOrderBody() []byte {
-	body := map[string]any{
-		"status": "processing",
-		"total":  149900,
-	}
-
-	return mustJSON(body)
-}
-
-func mustJSON(value any) []byte {
-	body, err := json.Marshal(value)
-	if err != nil {
-		panic(fmt.Sprintf("marshal static demo request: %v", err))
-	}
-
-	return body
 }

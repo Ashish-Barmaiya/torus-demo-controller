@@ -145,6 +145,7 @@ func TestRequestSizeValid(t *testing.T) {
 		RequestSize64KB,
 		RequestSize256KB,
 		RequestSize1MB,
+		RequestSize4MB,
 	}
 
 	for _, size := range tests {
