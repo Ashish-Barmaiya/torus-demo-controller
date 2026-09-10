@@ -10,11 +10,16 @@ import (
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 )
 
 type Executor interface {
-	Execute(context.Context, demo.Scenario) (execution.Result, error)
+	Execute(
+		context.Context,
+		string,
+		demo.Scenario,
+	) (execution.Result, error)
 }
 
 type ErrorCode string
@@ -87,12 +92,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type runResponse struct {
+	ExecutionID   string           `json:"execution_id"`
 	Scenario      demo.Scenario    `json:"scenario"`
 	TotalDuration time.Duration    `json:"total_duration"`
 	Requests      []requestSummary `json:"requests"`
 }
 
 type requestSummary struct {
+	RequestID  string        `json:"request_id"`
 	Index      int           `json:"index"`
 	StatusCode int           `json:"status_code"`
 	Status     string        `json:"status"`
@@ -142,6 +149,15 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	executionID, err := identity.NewExecutionID()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "failed to create execution ID",
+		})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(
 		r.Context(),
 		s.policy.MaxExecutionDuration,
@@ -150,6 +166,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.executor.Execute(
 		ctx,
+		executionID,
 		scenario,
 	)
 	if err != nil {
@@ -174,6 +191,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := runResponse{
+		ExecutionID:   result.ExecutionID,
 		Scenario:      result.Scenario,
 		TotalDuration: result.TotalDuration,
 		Requests:      make([]requestSummary, len(result.Requests)),
@@ -181,6 +199,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 	for i, requestResult := range result.Requests {
 		response.Requests[i] = requestSummary{
+			RequestID:  requestResult.RequestID,
 			Index:      requestResult.Index,
 			StatusCode: requestResult.StatusCode,
 			Status:     requestResult.Status,

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/request"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/torus"
 )
@@ -14,6 +15,7 @@ import (
 const DefaultMaxConcurrency = 10
 
 type RequestResult struct {
+	RequestID  string
 	Index      int
 	StatusCode int
 	Status     string
@@ -24,6 +26,7 @@ type RequestResult struct {
 }
 
 type Result struct {
+	ExecutionID   string
 	Scenario      demo.Scenario
 	Requests      []RequestResult
 	TotalDuration time.Duration
@@ -61,6 +64,7 @@ func NewExecutor(
 
 func (e *Executor) Execute(
 	ctx context.Context,
+	executionID string,
 	scenario demo.Scenario,
 ) (Result, error) {
 	if err := scenario.Validate(); err != nil {
@@ -97,11 +101,21 @@ func (e *Executor) Execute(
 				<-sem
 			}()
 
-			req, err := e.generator.Build(scenario)
+			requestID, err := identity.NewRequestID()
 			if err != nil {
 				results[index] = RequestResult{
 					Index: index,
-					Error: err.Error(),
+					Error: fmt.Sprintf("generate request ID: %v", err),
+				}
+				return
+			}
+
+			req, err := e.generator.Build(scenario)
+			if err != nil {
+				results[index] = RequestResult{
+					RequestID: requestID,
+					Index:     index,
+					Error:     err.Error(),
 				}
 				return
 			}
@@ -111,6 +125,7 @@ func (e *Executor) Execute(
 			result, err := e.torusClient.Do(req)
 
 			requestResult := RequestResult{
+				RequestID:  requestID,
 				Index:      index,
 				StatusCode: result.StatusCode,
 				Status:     result.Status,
@@ -130,6 +145,7 @@ func (e *Executor) Execute(
 	wg.Wait()
 
 	return Result{
+		ExecutionID:   executionID,
 		Scenario:      scenario,
 		Requests:      results,
 		TotalDuration: time.Since(start),

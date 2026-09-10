@@ -52,10 +52,15 @@ func TestExecutorExecute(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(5),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
 	}
 
 	if len(result.Requests) != 5 {
@@ -66,7 +71,15 @@ func TestExecutorExecute(t *testing.T) {
 		)
 	}
 
+	seen := make(map[string]struct{}, len(result.Requests))
 	for i, requestResult := range result.Requests {
+		if requestResult.RequestID == "" {
+			t.Fatal("request ID must not be empty")
+		}
+		if _, exists := seen[requestResult.RequestID]; exists {
+			t.Fatalf("duplicate request ID: %s", requestResult.RequestID)
+		}
+		seen[requestResult.RequestID] = struct{}{}
 		if requestResult.Index != i {
 			t.Fatalf(
 				"request index = %d, want %d",
@@ -144,6 +157,7 @@ func TestExecutorRespectsConcurrencyLimit(t *testing.T) {
 
 	_, err = executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(10),
 	)
 	if err != nil {
@@ -187,6 +201,7 @@ func TestExecutorContextCancellation(t *testing.T) {
 
 	result, err := executor.Execute(
 		ctx,
+		"exec_test",
 		testScenario(5),
 	)
 	if err != nil {
@@ -228,6 +243,7 @@ func TestExecutorRejectsInvalidScenario(t *testing.T) {
 
 	_, err = executor.Execute(
 		context.Background(),
+		"exec_test",
 		scenario,
 	)
 
@@ -265,13 +281,21 @@ func TestExecutorPropagatesResponse(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(1),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
 	}
 
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
+	}
+
 	requestResult := result.Requests[0]
+	if requestResult.RequestID == "" {
+		t.Fatal("request ID must not be empty")
+	}
 
 	if requestResult.StatusCode != http.StatusCreated {
 		t.Fatalf(
@@ -327,13 +351,21 @@ func TestExecutorErrorResponse(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(1),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
 	}
 
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
+	}
+
 	requestResult := result.Requests[0]
+	if requestResult.RequestID == "" {
+		t.Fatal("request ID must not be empty")
+	}
 
 	if requestResult.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf(
@@ -370,10 +402,15 @@ func TestExecutorTotalDuration(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(1),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
 	}
 
 	if result.TotalDuration < 50*time.Millisecond {
@@ -409,10 +446,19 @@ func TestExecutorDoesNotRequireResponseBody(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(1),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
+	}
+
+	if result.Requests[0].RequestID == "" {
+		t.Fatal("request ID must not be empty")
 	}
 
 	if result.Requests[0].StatusCode != http.StatusNoContent {
@@ -449,10 +495,15 @@ func TestExecutorRequestCountOne(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_test",
 		testScenario(1),
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_test" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_test")
 	}
 
 	if len(result.Requests) != 1 {
@@ -460,5 +511,52 @@ func TestExecutorRequestCountOne(t *testing.T) {
 			"requests = %d, want 1",
 			len(result.Requests),
 		)
+	}
+}
+
+func TestExecutorGeneratesUniqueRequestIDsConcurrently(t *testing.T) {
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+	defer server.Close()
+
+	generator := request.NewGenerator(
+		server.URL,
+		testIDSource{
+			userID:  "usr_000005",
+			orderID: "ord_000007",
+		},
+	)
+
+	client := torus.NewClient(5 * time.Second)
+	executor, err := NewExecutor(generator, client, 10)
+	if err != nil {
+		t.Fatalf("NewExecutor() error: %v", err)
+	}
+
+	result, err := executor.Execute(
+		context.Background(),
+		"exec_concurrent",
+		testScenario(50),
+	)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_concurrent" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_concurrent")
+	}
+
+	seen := make(map[string]struct{}, len(result.Requests))
+	for i, requestResult := range result.Requests {
+		if requestResult.RequestID == "" {
+			t.Fatal("request ID must not be empty")
+		}
+		if _, exists := seen[requestResult.RequestID]; exists {
+			t.Fatalf("duplicate request ID at index %d: %s", i, requestResult.RequestID)
+		}
+		seen[requestResult.RequestID] = struct{}{}
 	}
 }

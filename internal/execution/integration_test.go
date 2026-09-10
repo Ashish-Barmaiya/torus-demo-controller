@@ -12,8 +12,24 @@ import (
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/torus"
 )
 
+func requireTorus(t *testing.T) string {
+	t.Helper()
+
+	resp, err := http.Get("http://localhost:8080/health")
+	if err != nil {
+		t.Skip("skipping Torus integration test: local Torus service is not running")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Skip("skipping Torus integration test: local Torus service is not healthy")
+	}
+
+	return "http://localhost:8080"
+}
+
 func TestExecuteThroughTorus(t *testing.T) {
-	torusURL := "http://localhost:8080"
+	torusURL := requireTorus(t)
 
 	generator := request.NewGenerator(
 		torusURL,
@@ -45,10 +61,15 @@ func TestExecuteThroughTorus(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_integration_users",
 		scenario,
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_integration_users" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_integration_users")
 	}
 
 	if len(result.Requests) != 1 {
@@ -59,6 +80,9 @@ func TestExecuteThroughTorus(t *testing.T) {
 	}
 
 	requestResult := result.Requests[0]
+	if requestResult.RequestID == "" {
+		t.Fatal("request ID must not be empty")
+	}
 
 	if requestResult.StatusCode != http.StatusOK {
 		t.Fatalf(
@@ -94,7 +118,7 @@ func TestExecuteThroughTorus(t *testing.T) {
 }
 
 func TestExecuteOrdersThroughTorus(t *testing.T) {
-	torusURL := "http://localhost:8080"
+	torusURL := requireTorus(t)
 
 	generator := request.NewGenerator(
 		torusURL,
@@ -126,10 +150,15 @@ func TestExecuteOrdersThroughTorus(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_integration_orders",
 		scenario,
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_integration_orders" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_integration_orders")
 	}
 
 	if len(result.Requests) != 1 {
@@ -140,6 +169,9 @@ func TestExecuteOrdersThroughTorus(t *testing.T) {
 	}
 
 	requestResult := result.Requests[0]
+	if requestResult.RequestID == "" {
+		t.Fatal("request ID must not be empty")
+	}
 
 	if requestResult.StatusCode != http.StatusOK {
 		t.Fatalf(
@@ -169,7 +201,7 @@ func TestExecuteOrdersThroughTorus(t *testing.T) {
 }
 
 func TestExecuteSlowSimulationThroughTorus(t *testing.T) {
-	torusURL := "http://localhost:8080"
+	torusURL := requireTorus(t)
 
 	generator := request.NewGenerator(
 		torusURL,
@@ -203,10 +235,15 @@ func TestExecuteSlowSimulationThroughTorus(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_integration_slow",
 		scenario,
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_integration_slow" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_integration_slow")
 	}
 
 	elapsed := time.Since(start)
@@ -228,7 +265,7 @@ func TestExecuteSlowSimulationThroughTorus(t *testing.T) {
 }
 
 func TestConcurrentSlowRequestsThroughTorus(t *testing.T) {
-	torusURL := "http://localhost:8080"
+	torusURL := requireTorus(t)
 
 	generator := request.NewGenerator(
 		torusURL,
@@ -259,10 +296,15 @@ func TestConcurrentSlowRequestsThroughTorus(t *testing.T) {
 
 	result, err := executor.Execute(
 		context.Background(),
+		"exec_integration_concurrent",
 		scenario,
 	)
 	if err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if result.ExecutionID != "exec_integration_concurrent" {
+		t.Fatalf("execution ID = %q, want %q", result.ExecutionID, "exec_integration_concurrent")
 	}
 
 	elapsed := time.Since(start)

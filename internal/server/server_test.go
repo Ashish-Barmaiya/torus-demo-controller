@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,8 +17,9 @@ import (
 )
 
 type fakeExecutor struct {
-	result execution.Result
-	err    error
+	result      execution.Result
+	err         error
+	executionID string
 
 	called   bool
 	scenario demo.Scenario
@@ -27,11 +29,20 @@ type fakeExecutor struct {
 
 func (f *fakeExecutor) Execute(
 	ctx context.Context,
+	executionID string,
 	scenario demo.Scenario,
 ) (execution.Result, error) {
 	f.called = true
+	f.executionID = executionID
 	f.scenario = scenario
 	f.ctx = ctx
+	f.result.ExecutionID = executionID
+
+	for i := range f.result.Requests {
+		if f.result.Requests[i].RequestID == "" {
+			f.result.Requests[i].RequestID = fmt.Sprintf("req_%d", i)
+		}
+	}
 
 	if f.block {
 		<-ctx.Done()
@@ -167,6 +178,10 @@ func TestServerRun(t *testing.T) {
 		t.Fatal("executor was not called")
 	}
 
+	if executor.executionID == "" {
+		t.Fatal("executor did not receive a non-empty execution ID")
+	}
+
 	if executor.scenario.RequestCount != 2 {
 		t.Fatalf(
 			"request count = %d, want %d",
@@ -189,12 +204,31 @@ func TestServerRun(t *testing.T) {
 		)
 	}
 
+	if response.ExecutionID == "" {
+		t.Fatal("execution_id must not be empty")
+	}
+
+	if response.ExecutionID != executor.executionID {
+		t.Fatalf("execution_id = %q, want %q", response.ExecutionID, executor.executionID)
+	}
+
 	if len(response.Requests) != 2 {
 		t.Fatalf(
 			"requests = %d, want %d",
 			len(response.Requests),
 			2,
 		)
+	}
+
+	seen := make(map[string]struct{}, len(response.Requests))
+	for _, requestResult := range response.Requests {
+		if requestResult.RequestID == "" {
+			t.Fatal("request_id must not be empty")
+		}
+		if _, exists := seen[requestResult.RequestID]; exists {
+			t.Fatalf("duplicate request ID: %s", requestResult.RequestID)
+		}
+		seen[requestResult.RequestID] = struct{}{}
 	}
 
 	if response.Requests[0].BodySize != 1024 {
