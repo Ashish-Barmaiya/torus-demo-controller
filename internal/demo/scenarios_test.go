@@ -286,3 +286,30 @@ func TestScenarioValidateRequestCount(t *testing.T) {
 		})
 	}
 }
+
+func TestResponseSizeBytes(t *testing.T) {
+	tests := []struct {
+		size  ResponseSize
+		bytes int64
+	}{
+		{ResponseSizeNone, 0},
+		{ResponseSize1KB, 1 << 10},
+		{ResponseSize16KB, 16 << 10},
+		{ResponseSize64KB, 64 << 10},
+		{ResponseSize256KB, 256 << 10},
+		{ResponseSize1MB, 1 << 20},
+		{ResponseSize4MB, 4 << 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.size), func(t *testing.T) {
+			if got := tt.size.Bytes(); got != tt.bytes {
+				t.Fatalf(
+					"Bytes() = %d, want %d",
+					got,
+					tt.bytes,
+				)
+			}
+		})
+	}
+}

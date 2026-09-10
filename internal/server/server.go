@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 )
 
 type Executor interface {
@@ -21,6 +22,7 @@ type ErrorCode string
 const (
 	ErrorCodeInvalidJSON      ErrorCode = "INVALID_JSON"
 	ErrorCodeInvalidScenario  ErrorCode = "INVALID_SCENARIO"
+	ErrorCodePolicyRejected   ErrorCode = "POLICY_REJECTED"
 	ErrorCodeExecutionTimeout ErrorCode = "EXECUTION_TIMEOUT"
 	ErrorCodeUpstreamError    ErrorCode = "UPSTREAM_ERROR"
 	ErrorCodeInternal         ErrorCode = "INTERNAL_ERROR"
@@ -47,15 +49,17 @@ type apiErrorBody struct {
 
 type Server struct {
 	executor Executor
+	policy   policy.Policy
 }
 
-func New(executor Executor) (*Server, error) {
+func New(executor Executor, executionPolicy policy.Policy) (*Server, error) {
 	if executor == nil {
 		return nil, fmt.Errorf("executor must not be nil")
 	}
 
 	return &Server{
 		executor: executor,
+		policy:   executionPolicy,
 	}, nil
 }
 
@@ -130,20 +134,35 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.executor.Execute(
+	if err := s.policy.Validate(scenario); err != nil {
+		writeAPIError(w, http.StatusBadRequest, APIError{
+			Code:    ErrorCodePolicyRejected,
+			Message: err.Error(),
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(
 		r.Context(),
+		s.policy.MaxExecutionDuration,
+	)
+	defer cancel()
+
+	result, err := s.executor.Execute(
+		ctx,
 		scenario,
 	)
 	if err != nil {
-		apiErr := classifyExecutionError(err, result)
+		apiErr := classifyExecutionError(err, ctx, r.Context(), result)
 		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
 		return
 	}
 
-	if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) &&
+		!errors.Is(r.Context().Err(), context.DeadlineExceeded) {
 		apiErr := APIError{
 			Code:    ErrorCodeExecutionTimeout,
-			Message: "scenario execution timed out",
+			Message: "execution timed out",
 		}
 		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
 		return
@@ -188,7 +207,7 @@ func writeAPIError(w http.ResponseWriter, status int, apiErr APIError) {
 
 func apiErrorStatus(apiErr APIError) int {
 	switch apiErr.Code {
-	case ErrorCodeInvalidJSON, ErrorCodeInvalidScenario:
+	case ErrorCodeInvalidJSON, ErrorCodeInvalidScenario, ErrorCodePolicyRejected:
 		return http.StatusBadRequest
 	case ErrorCodeExecutionTimeout:
 		return http.StatusGatewayTimeout
@@ -201,11 +220,18 @@ func apiErrorStatus(apiErr APIError) int {
 	}
 }
 
-func classifyExecutionError(err error, result execution.Result) APIError {
-	if errors.Is(err, context.DeadlineExceeded) {
+func classifyExecutionError(
+	err error,
+	ctx context.Context,
+	requestContext context.Context,
+	result execution.Result,
+) APIError {
+	if !errors.Is(requestContext.Err(), context.DeadlineExceeded) &&
+		(errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+			errors.Is(err, context.DeadlineExceeded)) {
 		return APIError{
 			Code:    ErrorCodeExecutionTimeout,
-			Message: "scenario execution timed out",
+			Message: "execution timed out",
 		}
 	}
 

@@ -188,6 +188,27 @@ func (s ResponseSize) Valid() bool {
 	}
 }
 
+func (s ResponseSize) Bytes() int64 {
+	switch s {
+	case ResponseSizeNone:
+		return 0
+	case ResponseSize1KB:
+		return 1 << 10
+	case ResponseSize16KB:
+		return 16 << 10
+	case ResponseSize64KB:
+		return 64 << 10
+	case ResponseSize256KB:
+		return 256 << 10
+	case ResponseSize1MB:
+		return 1 << 20
+	case ResponseSize4MB:
+		return 4 << 20
+	default:
+		return 0
+	}
+}
+
 type Scenario struct {
 	Service      Service      `json:"service"`
 	Operation    Operation    `json:"operation"`

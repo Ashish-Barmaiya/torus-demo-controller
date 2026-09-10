@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 )
 
 type fakeExecutor struct {
@@ -20,6 +21,8 @@ type fakeExecutor struct {
 
 	called   bool
 	scenario demo.Scenario
+	ctx      context.Context
+	block    bool
 }
 
 func (f *fakeExecutor) Execute(
@@ -28,6 +31,12 @@ func (f *fakeExecutor) Execute(
 ) (execution.Result, error) {
 	f.called = true
 	f.scenario = scenario
+	f.ctx = ctx
+
+	if f.block {
+		<-ctx.Done()
+		return f.result, ctx.Err()
+	}
 
 	return f.result, f.err
 }
@@ -35,7 +44,7 @@ func (f *fakeExecutor) Execute(
 func TestServerHealth(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -112,7 +121,7 @@ func TestServerRun(t *testing.T) {
 		},
 	}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -210,7 +219,7 @@ func TestServerRunDefaultsRequestCount(t *testing.T) {
 		},
 	}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -263,7 +272,7 @@ func TestServerRunDefaultsRequestCount(t *testing.T) {
 func TestServerRunRejectsInvalidScenario(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -326,7 +335,7 @@ func TestServerRunRejectsInvalidService(t *testing.T) {
 func TestServerRunRejectsInvalidJSON(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -367,7 +376,7 @@ func TestServerRunRejectsInvalidJSON(t *testing.T) {
 func TestServerMethodNotAllowed(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -405,10 +414,12 @@ func TestServerMethodNotAllowed(t *testing.T) {
 
 func TestServerExecutorError(t *testing.T) {
 	executor := &fakeExecutor{
-		err: context.DeadlineExceeded,
+		block: true,
 	}
+	executionPolicy := policy.Default()
+	executionPolicy.MaxExecutionDuration = 20 * time.Millisecond
 
-	server, err := New(executor)
+	server, err := New(executor, executionPolicy)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -447,7 +458,38 @@ func TestServerExecutorError(t *testing.T) {
 		)
 	}
 
-	assertAPIError(t, resp, ErrorCodeExecutionTimeout, "scenario execution timed out")
+	assertAPIError(t, resp, ErrorCodeExecutionTimeout, "execution timed out")
+
+	if executor.ctx == nil {
+		t.Fatal("executor did not receive a context")
+	}
+	if _, ok := executor.ctx.Deadline(); !ok {
+		t.Fatal("executor context has no deadline")
+	}
+}
+
+func TestServerPolicyRejection(t *testing.T) {
+	executor := &fakeExecutor{}
+	executionPolicy := policy.Default()
+	executionPolicy.MaxRequests = 1
+
+	server, err := New(executor, executionPolicy)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	resp := postRun(t, ts, `{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb","request_count":2}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	assertAPIError(t, resp, ErrorCodePolicyRejected, "request count 2 exceeds maximum 1")
+	if executor.called {
+		t.Fatal("executor must not be called when policy rejects scenario")
+	}
 }
 
 func TestServerUpstreamError(t *testing.T) {
@@ -533,7 +575,7 @@ func TestServerMethodNotAllowedReturnsJSONError(t *testing.T) {
 
 func newTestServer(t *testing.T, executor Executor) *httptest.Server {
 	t.Helper()
-	server, err := New(executor)
+	server, err := New(executor, policy.Default())
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
