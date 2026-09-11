@@ -3,6 +3,7 @@ package executionservice
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
@@ -60,9 +61,44 @@ func (s *Service) Execute(
 		return execution.Result{}, fmt.Errorf("start execution: %w", err)
 	}
 
-	result, err := s.executor.Execute(ctx, executionID, scenario)
-	if err != nil {
-		return result, s.finishError(ctx, executionID, err)
+	return s.executeAndRecord(ctx, executionID, scenario)
+}
+
+func (s *Service) Start(
+	_ context.Context,
+	executionID string,
+	scenario demo.Scenario,
+	timeout time.Duration,
+) error {
+	if timeout <= 0 {
+		return fmt.Errorf("execution timeout must be greater than zero")
+	}
+
+	if _, err := s.lifecycleManager.Create(executionID, scenario); err != nil {
+		return fmt.Errorf("create execution: %w", err)
+	}
+
+	if err := s.lifecycleManager.Start(executionID); err != nil {
+		return fmt.Errorf("start execution: %w", err)
+	}
+
+	executionCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	go func() {
+		defer cancel()
+		_, _ = s.executeAndRecord(executionCtx, executionID, scenario)
+	}()
+
+	return nil
+}
+
+func (s *Service) executeAndRecord(
+	ctx context.Context,
+	executionID string,
+	scenario demo.Scenario,
+) (execution.Result, error) {
+	result, executionErr := s.executor.Execute(ctx, executionID, scenario)
+	if executionErr != nil {
+		return result, s.finishError(ctx, executionID, executionErr)
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {

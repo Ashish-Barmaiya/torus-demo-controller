@@ -3,8 +3,10 @@ package executionservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 )
 
 type fakeExecutor struct {
+	mu sync.Mutex
+
 	result  execution.Result
 	err     error
 	block   bool
@@ -30,12 +34,14 @@ func (f *fakeExecutor) Execute(
 	executionID string,
 	scenario demo.Scenario,
 ) (execution.Result, error) {
+	f.mu.Lock()
 	f.called = true
 	f.executionID = executionID
 	f.scenario = scenario
+	f.mu.Unlock()
 
 	if f.block {
-		close(f.started)
+		f.started <- struct{}{}
 		select {
 		case <-f.release:
 		case <-ctx.Done():
@@ -58,6 +64,43 @@ type recordingLifecycle struct {
 	completeErr error
 	failErr     error
 	cancelErr   error
+}
+
+type asyncLifecycle struct {
+	manager *lifecycle.Manager
+	done    chan struct{}
+}
+
+func (m *asyncLifecycle) Create(id string, scenario demo.Scenario) (*lifecycle.Execution, error) {
+	return m.manager.Create(id, scenario)
+}
+
+func (m *asyncLifecycle) Start(id string) error {
+	return m.manager.Start(id)
+}
+
+func (m *asyncLifecycle) Complete(
+	id string,
+	result execution.Result,
+) error {
+	err := m.manager.Complete(id, result)
+	m.done <- struct{}{}
+	return err
+}
+
+func (m *asyncLifecycle) Fail(
+	id string,
+	err error,
+) error {
+	lifecycleErr := m.manager.Fail(id, err)
+	m.done <- struct{}{}
+	return lifecycleErr
+}
+
+func (m *asyncLifecycle) Cancel(id string) error {
+	err := m.manager.Cancel(id)
+	m.done <- struct{}{}
+	return err
 }
 
 func (m *recordingLifecycle) Create(id string, scenario demo.Scenario) (*lifecycle.Execution, error) {
@@ -238,23 +281,75 @@ func TestExecuteCallerCancellation(t *testing.T) {
 
 func TestExecutePolicyTimeoutFails(t *testing.T) {
 	manager := testManager(t)
+
 	executor := &fakeExecutor{
 		block:   true,
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	service, _ := New(executor, manager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+
+	service, err := New(executor, manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Millisecond,
+	)
 	defer cancel()
 
-	_, err := service.Execute(ctx, "exec_1", testScenario())
-	<-executor.started
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want deadline exceeded", err)
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := service.Execute(
+			ctx,
+			"exec_1",
+			testScenario(),
+		)
+		done <- err
+	}()
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
 	}
-	snapshot, _ := manager.Get("exec_1")
-	if snapshot.Status != lifecycle.StatusFailed || snapshot.Error != context.DeadlineExceeded.Error() {
-		t.Fatalf("snapshot = %+v", snapshot)
+
+	var executionErr error
+
+	select {
+	case executionErr = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("execution did not finish")
+	}
+
+	if !errors.Is(executionErr, context.DeadlineExceeded) {
+		t.Fatalf(
+			"error = %v, want deadline exceeded",
+			executionErr,
+		)
+	}
+
+	snapshot, ok := manager.Get("exec_1")
+	if !ok {
+		t.Fatal("execution not found")
+	}
+
+	if snapshot.Status != lifecycle.StatusFailed {
+		t.Fatalf(
+			"status = %q, want %q",
+			snapshot.Status,
+			lifecycle.StatusFailed,
+		)
+	}
+
+	if snapshot.Error != context.DeadlineExceeded.Error() {
+		t.Fatalf(
+			"lifecycle error = %q, want %q",
+			snapshot.Error,
+			context.DeadlineExceeded.Error(),
+		)
 	}
 }
 
@@ -302,8 +397,9 @@ func TestExecuteReturnsLifecycleOperationErrors(t *testing.T) {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
 				cancel()
+
 				executor.block = true
-				executor.started = make(chan struct{})
+				executor.started = make(chan struct{}, 1)
 				executor.release = make(chan struct{})
 			}
 			_, err := service.Execute(ctx, "exec_1", testScenario())
@@ -311,6 +407,201 @@ func TestExecuteReturnsLifecycleOperationErrors(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestStartRejectsInvalidTimeout(t *testing.T) {
+	service, err := New(&fakeExecutor{}, testManager(t))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		if err := service.Start(context.Background(), "exec_1", testScenario(), timeout); err == nil {
+			t.Fatalf("Start() with timeout %v should fail", timeout)
+		}
+	}
+}
+
+func TestStartReturnsBeforeExecutorCompletionAndCompletesAsync(t *testing.T) {
+	manager := testManager(t)
+	lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  execution.Result{ExecutionID: "exec_1"},
+	}
+	service, err := New(executor, lifecycleRecorder)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+	snapshot, ok := manager.Get("exec_1")
+	if !ok || snapshot.Status != lifecycle.StatusRunning {
+		t.Fatalf("status after Start = %+v, found = %v; want running", snapshot, ok)
+	}
+
+	select {
+	case <-lifecycleRecorder.done:
+		t.Fatal("Start waited for executor completion")
+	default:
+	}
+
+	close(executor.release)
+	select {
+	case <-lifecycleRecorder.done:
+	case <-time.After(time.Second):
+		t.Fatal("async execution did not complete")
+	}
+
+	snapshot, ok = manager.Get("exec_1")
+	if !ok || snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("final snapshot = %+v, found = %v", snapshot, ok)
+	}
+	if snapshot.Result == nil || snapshot.Result.ExecutionID != "exec_1" {
+		t.Fatalf("stored result = %+v", snapshot.Result)
+	}
+}
+
+func TestStartParentCancellationDoesNotCancelExecution(t *testing.T) {
+	manager := testManager(t)
+	lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service, _ := New(executor, lifecycleRecorder)
+	parent, cancelParent := context.WithCancel(context.Background())
+
+	if err := service.Start(parent, "exec_1", testScenario(), time.Second); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	<-executor.started
+	cancelParent()
+
+	select {
+	case <-lifecycleRecorder.done:
+		t.Fatal("parent cancellation terminated execution")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(executor.release)
+	select {
+	case <-lifecycleRecorder.done:
+	case <-time.After(time.Second):
+		t.Fatal("async execution did not complete")
+	}
+
+	snapshot, _ := manager.Get("exec_1")
+	if snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("status = %q, want completed", snapshot.Status)
+	}
+}
+
+func TestStartExecutorFailureAndTimeout(t *testing.T) {
+	t.Run("executor failure", func(t *testing.T) {
+		manager := testManager(t)
+		lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
+		executor := &fakeExecutor{err: errors.New("executor failed")}
+		service, _ := New(executor, lifecycleRecorder)
+
+		if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+			t.Fatalf("Start() error: %v", err)
+		}
+		<-lifecycleRecorder.done
+		snapshot, _ := manager.Get("exec_1")
+		if snapshot.Status != lifecycle.StatusFailed || snapshot.Error != "executor failed" {
+			t.Fatalf("snapshot = %+v", snapshot)
+		}
+	})
+
+	t.Run("policy timeout", func(t *testing.T) {
+		manager := testManager(t)
+		lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
+		executor := &fakeExecutor{
+			block:   true,
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		service, _ := New(executor, lifecycleRecorder)
+
+		if err := service.Start(context.Background(), "exec_1", testScenario(), time.Millisecond); err != nil {
+			t.Fatalf("Start() error: %v", err)
+		}
+		<-executor.started
+		select {
+		case <-lifecycleRecorder.done:
+		case <-time.After(time.Second):
+			t.Fatal("timeout execution did not finish")
+		}
+		snapshot, _ := manager.Get("exec_1")
+		if snapshot.Status != lifecycle.StatusFailed || snapshot.Error != context.DeadlineExceeded.Error() {
+			t.Fatalf("snapshot = %+v", snapshot)
+		}
+	})
+}
+
+func TestStartCompletesHTTPAndRequestFailures(t *testing.T) {
+	for name, result := range map[string]execution.Result{
+		"http failure":    {ExecutionID: "exec_1", Requests: []execution.RequestResult{{StatusCode: 503}}},
+		"request failure": {ExecutionID: "exec_1", Requests: []execution.RequestResult{{StatusCode: 0, Error: "connection refused"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			manager := testManager(t)
+			lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
+			service, _ := New(&fakeExecutor{result: result}, lifecycleRecorder)
+			if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+				t.Fatalf("Start() error: %v", err)
+			}
+			<-lifecycleRecorder.done
+			snapshot, _ := manager.Get("exec_1")
+			if snapshot.Status != lifecycle.StatusCompleted {
+				t.Fatalf("status = %q, want completed", snapshot.Status)
+			}
+		})
+	}
+}
+
+func TestStartRunsConcurrentExecutionsIndependently(t *testing.T) {
+	manager := testManager(t)
+	lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{}, 3)}
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 3),
+		release: make(chan struct{}),
+	}
+	service, _ := New(executor, lifecycleRecorder)
+
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("exec_%d", i)
+		if err := service.Start(context.Background(), id, testScenario(), time.Second); err != nil {
+			t.Fatalf("Start(%s) error: %v", id, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		<-executor.started
+	}
+	close(executor.release)
+	for i := 0; i < 3; i++ {
+		<-lifecycleRecorder.done
+	}
+
+	for i := 1; i <= 3; i++ {
+		snapshot, _ := manager.Get(fmt.Sprintf("exec_%d", i))
+		if snapshot.Status != lifecycle.StatusCompleted {
+			t.Fatalf("execution %d status = %q, want completed", i, snapshot.Status)
+		}
 	}
 }
 
