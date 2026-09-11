@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"time"
 )
 
 type UserRef struct {
@@ -27,6 +28,10 @@ type RandomIDSource struct {
 }
 
 func NewRandomIDSource(seed int64) *RandomIDSource {
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+
 	return &RandomIDSource{
 		rng: rand.New(rand.NewSource(seed)),
 	}

@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
 
 type Executor interface {
@@ -28,6 +31,7 @@ const (
 	ErrorCodeInvalidJSON      ErrorCode = "INVALID_JSON"
 	ErrorCodeInvalidScenario  ErrorCode = "INVALID_SCENARIO"
 	ErrorCodePolicyRejected   ErrorCode = "POLICY_REJECTED"
+	ErrorCodeRateLimited      ErrorCode = "RATE_LIMITED"
 	ErrorCodeExecutionTimeout ErrorCode = "EXECUTION_TIMEOUT"
 	ErrorCodeUpstreamError    ErrorCode = "UPSTREAM_ERROR"
 	ErrorCodeInternal         ErrorCode = "INTERNAL_ERROR"
@@ -55,16 +59,26 @@ type apiErrorBody struct {
 type Server struct {
 	executor Executor
 	policy   policy.Policy
+	limiter  *ratelimit.Limiter
 }
 
-func New(executor Executor, executionPolicy policy.Policy) (*Server, error) {
+func New(executor Executor, executionPolicy policy.Policy, opts ...*ratelimit.Limiter) (*Server, error) {
 	if executor == nil {
 		return nil, fmt.Errorf("executor must not be nil")
+	}
+
+	var limiter *ratelimit.Limiter
+	if len(opts) > 0 {
+		limiter = opts[0]
+	}
+	if limiter == nil {
+		limiter = ratelimit.NewDefault()
 	}
 
 	return &Server{
 		executor: executor,
 		policy:   executionPolicy,
+		limiter:  limiter,
 	}, nil
 }
 
@@ -149,6 +163,16 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	client := clientKey(r)
+	if !s.limiter.Allow(client) {
+		writeAPIError(w, http.StatusTooManyRequests, APIError{
+			Code:    ErrorCodeRateLimited,
+			Message: "rate limit exceeded",
+		})
+		return
+	}
+	defer s.limiter.Done(client)
+
 	executionID, err := identity.NewExecutionID()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, APIError{
@@ -169,11 +193,6 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		executionID,
 		scenario,
 	)
-	if err != nil {
-		apiErr := classifyExecutionError(err, ctx, r.Context(), result)
-		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
-		return
-	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) &&
 		!errors.Is(r.Context().Err(), context.DeadlineExceeded) {
@@ -185,8 +204,9 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if apiErr := classifyRequestResults(result); apiErr != nil {
-		writeAPIError(w, apiErrorStatus(*apiErr), *apiErr)
+	if err != nil {
+		apiErr := classifyExecutionError(err)
+		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
 		return
 	}
 
@@ -228,6 +248,8 @@ func apiErrorStatus(apiErr APIError) int {
 	switch apiErr.Code {
 	case ErrorCodeInvalidJSON, ErrorCodeInvalidScenario, ErrorCodePolicyRejected:
 		return http.StatusBadRequest
+	case ErrorCodeRateLimited:
+		return http.StatusTooManyRequests
 	case ErrorCodeExecutionTimeout:
 		return http.StatusGatewayTimeout
 	case ErrorCodeUpstreamError:
@@ -239,25 +261,36 @@ func apiErrorStatus(apiErr APIError) int {
 	}
 }
 
-func classifyExecutionError(
-	err error,
-	ctx context.Context,
-	requestContext context.Context,
-	result execution.Result,
-) APIError {
-	if !errors.Is(requestContext.Err(), context.DeadlineExceeded) &&
-		(errors.Is(ctx.Err(), context.DeadlineExceeded) ||
-			errors.Is(err, context.DeadlineExceeded)) {
+func clientKey(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+
+	if r.RemoteAddr == "" {
+		return "unknown"
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+
+	if ip := net.ParseIP(r.RemoteAddr); ip != nil {
+		return ip.String()
+	}
+
+	if strings.HasPrefix(r.RemoteAddr, "[") && strings.Contains(r.RemoteAddr, "]") {
+		return strings.Trim(r.RemoteAddr, "[]")
+	}
+
+	return r.RemoteAddr
+}
+
+func classifyExecutionError(err error) APIError {
+	if errors.Is(err, context.DeadlineExceeded) {
 		return APIError{
 			Code:    ErrorCodeExecutionTimeout,
 			Message: "execution timed out",
-		}
-	}
-
-	if hasUpstreamFailure(result) {
-		return APIError{
-			Code:    ErrorCodeUpstreamError,
-			Message: "upstream request failed",
 		}
 	}
 
@@ -265,26 +298,4 @@ func classifyExecutionError(
 		Code:    ErrorCodeInternal,
 		Message: "internal server error",
 	}
-}
-
-func classifyRequestResults(result execution.Result) *APIError {
-	if !hasUpstreamFailure(result) {
-		return nil
-	}
-
-	apiErr := APIError{
-		Code:    ErrorCodeUpstreamError,
-		Message: "upstream request failed",
-	}
-	return &apiErr
-}
-
-func hasUpstreamFailure(result execution.Result) bool {
-	for _, requestResult := range result.Requests {
-		if requestResult.StatusCode == 0 && requestResult.Error != "" {
-			return true
-		}
-	}
-
-	return false
 }

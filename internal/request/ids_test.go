@@ -95,3 +95,19 @@ func assertOrderRef(t *testing.T, order OrderRef) {
 		t.Fatalf("order ID = %q, want %q", order.ID, wantID)
 	}
 }
+
+func TestNewRandomIDSourceZeroSeedIsNotFixed(t *testing.T) {
+	sourceA := NewRandomIDSource(0)
+	sourceB := NewRandomIDSource(0)
+
+	for i := 0; i < 10; i++ {
+		userA := sourceA.User()
+		userB := sourceB.User()
+
+		if userA != userB {
+			return
+		}
+	}
+
+	t.Fatal("zero-seed sources produced identical sequences")
+}

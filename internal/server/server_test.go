@@ -14,6 +14,7 @@ import (
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
 
 type fakeExecutor struct {
@@ -25,6 +26,30 @@ type fakeExecutor struct {
 	scenario demo.Scenario
 	ctx      context.Context
 	block    bool
+}
+
+type blockingExecutor struct {
+	started chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (e *blockingExecutor) Execute(
+	ctx context.Context,
+	executionID string,
+	scenario demo.Scenario,
+) (execution.Result, error) {
+	e.started <- struct{}{}
+	select {
+	case <-e.release:
+	case <-ctx.Done():
+		return execution.Result{}, ctx.Err()
+	}
+
+	return execution.Result{
+		ExecutionID: executionID,
+		Scenario:    scenario,
+	}, e.err
 }
 
 func (f *fakeExecutor) Execute(
@@ -526,10 +551,14 @@ func TestServerPolicyRejection(t *testing.T) {
 	}
 }
 
-func TestServerUpstreamError(t *testing.T) {
+func TestServerPreservesRequestNetworkError(t *testing.T) {
 	server := newTestServer(t, &fakeExecutor{
 		result: execution.Result{
-			Requests: []execution.RequestResult{{StatusCode: 0, Error: "connection refused"}},
+			Requests: []execution.RequestResult{
+				{StatusCode: http.StatusOK, Status: "200 OK"},
+				{StatusCode: 0, Error: "connection refused"},
+				{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable"},
+			},
 		},
 	})
 	defer server.Close()
@@ -537,10 +566,45 @@ func TestServerUpstreamError(t *testing.T) {
 	resp := postRun(t, server, validRequestBody())
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	assertAPIError(t, resp, ErrorCodeUpstreamError, "upstream request failed")
+
+	var body runResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Requests) != 3 {
+		t.Fatalf("requests = %d, want 3", len(body.Requests))
+	}
+	if body.Requests[0].StatusCode != http.StatusOK || body.Requests[0].Error != "" {
+		t.Fatalf("successful request = %+v", body.Requests[0])
+	}
+	if body.Requests[1].StatusCode != 0 || body.Requests[1].Error != "connection refused" {
+		t.Fatalf("failed request = %+v", body.Requests[1])
+	}
+	if body.Requests[2].StatusCode != http.StatusServiceUnavailable || body.Requests[2].Error != "" {
+		t.Fatalf("HTTP failure request = %+v", body.Requests[2])
+	}
+}
+
+func TestServerPreservesAllRequestNetworkErrors(t *testing.T) {
+	server := newTestServer(t, &fakeExecutor{
+		result: execution.Result{
+			Requests: []execution.RequestResult{
+				{StatusCode: 0, Error: "connection refused"},
+				{StatusCode: 0, Error: "context deadline exceeded"},
+			},
+		},
+	})
+	defer server.Close()
+
+	resp := postRun(t, server, validRequestBody())
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
 }
 
 func TestServerInternalError(t *testing.T) {
@@ -554,6 +618,131 @@ func TestServerInternalError(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
 	}
 	assertAPIError(t, resp, ErrorCodeInternal, "internal server error")
+}
+
+func TestServerRateLimitRejectsSameClient(t *testing.T) {
+	executor := &fakeExecutor{}
+	server, err := New(executor, policy.Default(), ratelimit.New(1, 1, time.Hour))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	first := serveRun(server.Handler(), "127.0.0.1:12345")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+
+	second := serveRun(server.Handler(), "127.0.0.1:54321")
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusTooManyRequests)
+	}
+	assertRecorderAPIError(t, second, ErrorCodeRateLimited, "rate limit exceeded")
+	if !executor.called {
+		t.Fatal("executor should be called for the admitted request")
+	}
+}
+
+func TestServerRateLimitUsesIndependentClientIPs(t *testing.T) {
+	executor := &blockingExecutor{
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	server, err := New(executor, policy.Default(), ratelimit.New(1, 100, time.Hour))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go func() { results <- serveRun(server.Handler(), "127.0.0.1:12345") }()
+	go func() { results <- serveRun(server.Handler(), "127.0.0.2:12345") }()
+
+	<-executor.started
+	<-executor.started
+	close(executor.release)
+
+	for range 2 {
+		if response := <-results; response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+		}
+	}
+}
+
+func TestServerRateLimitReleasesSlotAfterExecutionError(t *testing.T) {
+	executor := &fakeExecutor{
+		err: errors.New("unexpected failure"),
+	}
+
+	server, err := New(
+		executor,
+		policy.Default(),
+		ratelimit.New(1, 100, time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	handler := server.Handler()
+
+	first := serveRun(handler, "127.0.0.1:12345")
+	if first.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"first status = %d, want %d",
+			first.Code,
+			http.StatusInternalServerError,
+		)
+	}
+
+	second := serveRun(handler, "127.0.0.1:54321")
+	if second.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"second status = %d, want %d",
+			second.Code,
+			http.StatusInternalServerError,
+		)
+	}
+}
+
+func TestServerDefaultLimiterIsSharedByHandler(t *testing.T) {
+	server, err := New(&fakeExecutor{}, policy.Default())
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for i := 0; i < ratelimit.DefaultMaxConcurrentExecutions; i++ {
+		if !server.limiter.Allow("127.0.0.1") {
+			t.Fatalf("direct admission %d should succeed", i)
+		}
+	}
+	defer func() {
+		for i := 0; i < ratelimit.DefaultMaxConcurrentExecutions; i++ {
+			server.limiter.Done("127.0.0.1")
+		}
+	}()
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestClientKey(t *testing.T) {
+	tests := []struct {
+		remoteAddr string
+		want       string
+	}{
+		{remoteAddr: "127.0.0.1:12345", want: "127.0.0.1"},
+		{remoteAddr: "[::1]:54321", want: "::1"},
+		{remoteAddr: "127.0.0.1", want: "127.0.0.1"},
+		{remoteAddr: "unusual", want: "unusual"},
+	}
+
+	for _, test := range tests {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/run", nil)
+		req.RemoteAddr = test.remoteAddr
+		if got := clientKey(req); got != test.want {
+			t.Errorf("clientKey(%q) = %q, want %q", test.remoteAddr, got, test.want)
+		}
+	}
 }
 
 func TestServerCompletedUpstreamResponse(t *testing.T) {
@@ -616,6 +805,15 @@ func newTestServer(t *testing.T, executor Executor) *httptest.Server {
 	return httptest.NewServer(server.Handler())
 }
 
+func newTestServerWithLimiter(t *testing.T, executor Executor, limiter *ratelimit.Limiter) *httptest.Server {
+	t.Helper()
+	server, err := New(executor, policy.Default(), limiter)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	return httptest.NewServer(server.Handler())
+}
+
 func validRequestBody() string {
 	return `{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb"}`
 }
@@ -654,4 +852,144 @@ func assertAPIError(t *testing.T, resp *http.Response, code ErrorCode, message s
 
 func jsonBody(value string) *strings.Reader {
 	return strings.NewReader(value)
+}
+
+func serveRun(handler http.Handler, remoteAddr string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/run", strings.NewReader(validRequestBody()))
+	req.RemoteAddr = remoteAddr
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	return response
+}
+
+func assertRecorderAPIError(t *testing.T, response *httptest.ResponseRecorder, code ErrorCode, message string) {
+	t.Helper()
+	var body errorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode API error: %v", err)
+	}
+	if body.Error.Code != code || body.Error.Message != message {
+		t.Fatalf("error = %+v, want code %q and message %q", body.Error, code, message)
+	}
+}
+
+func TestServerRateLimitRejectsConcurrentExecutionForSameClient(t *testing.T) {
+	executor := &blockingExecutor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+
+	server, err := New(
+		executor,
+		policy.Default(),
+		ratelimit.New(1, 100, time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	handler := server.Handler()
+
+	firstResult := make(chan *httptest.ResponseRecorder, 1)
+
+	go func() {
+		firstResult <- serveRun(
+			handler,
+			"127.0.0.1:12345",
+		)
+	}()
+
+	<-executor.started
+
+	second := serveRun(
+		handler,
+		"127.0.0.1:54321",
+	)
+
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf(
+			"second status = %d, want %d",
+			second.Code,
+			http.StatusTooManyRequests,
+		)
+	}
+
+	assertRecorderAPIError(
+		t,
+		second,
+		ErrorCodeRateLimited,
+		"rate limit exceeded",
+	)
+
+	close(executor.release)
+
+	first := <-firstResult
+
+	if first.Code != http.StatusOK {
+		t.Fatalf(
+			"first status = %d, want %d",
+			first.Code,
+			http.StatusOK,
+		)
+	}
+}
+
+func TestServerPolicyRejectionDoesNotConsumeRateLimit(t *testing.T) {
+	executor := &fakeExecutor{}
+
+	executionPolicy := policy.Default()
+	executionPolicy.MaxRequests = 1
+
+	limiter := ratelimit.New(1, 1, time.Hour)
+
+	server, err := New(
+		executor,
+		executionPolicy,
+		limiter,
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/run",
+		strings.NewReader(
+			`{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb","request_count":2}`,
+		),
+	)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+
+	first := httptest.NewRecorder()
+	server.Handler().ServeHTTP(first, req)
+
+	if first.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"status = %d, want %d",
+			first.Code,
+			http.StatusBadRequest,
+		)
+	}
+
+	assertRecorderAPIError(
+		t,
+		first,
+		ErrorCodePolicyRejected,
+		"request count 2 exceeds maximum 1",
+	)
+
+	allowed := serveRun(
+		server.Handler(),
+		"127.0.0.1:12345",
+	)
+
+	if allowed.Code != http.StatusOK {
+		t.Fatalf(
+			"second status = %d, want %d",
+			allowed.Code,
+			http.StatusOK,
+		)
+	}
 }
