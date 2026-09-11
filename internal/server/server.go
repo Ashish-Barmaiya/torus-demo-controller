@@ -11,20 +11,11 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
-	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/executionservice"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
-	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
-
-type Executor interface {
-	Execute(
-		context.Context,
-		string,
-		demo.Scenario,
-	) (execution.Result, error)
-}
 
 type ErrorCode string
 
@@ -58,33 +49,27 @@ type apiErrorBody struct {
 }
 
 type Server struct {
-	executor         Executor
+	executionService *executionservice.Service
 	policy           policy.Policy
 	limiter          *ratelimit.Limiter
-	lifecycleManager *lifecycle.Manager
 }
 
 func New(
-	executor Executor,
+	executionService *executionservice.Service,
 	executionPolicy policy.Policy,
 	limiter *ratelimit.Limiter,
-	lifecycleManager *lifecycle.Manager,
 ) (*Server, error) {
-	if executor == nil {
-		return nil, fmt.Errorf("executor must not be nil")
+	if executionService == nil {
+		return nil, fmt.Errorf("execution service must not be nil")
 	}
 	if limiter == nil {
 		return nil, fmt.Errorf("limiter must not be nil")
 	}
-	if lifecycleManager == nil {
-		return nil, fmt.Errorf("lifecycle manager must not be nil")
-	}
 
 	return &Server{
-		executor:         executor,
+		executionService: executionService,
 		policy:           executionPolicy,
 		limiter:          limiter,
-		lifecycleManager: lifecycleManager,
 	}, nil
 }
 
@@ -188,29 +173,13 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.lifecycleManager.Create(executionID, scenario); err != nil {
-		writeAPIError(w, http.StatusInternalServerError, APIError{
-			Code:    ErrorCodeInternal,
-			Message: "failed to create execution",
-		})
-		return
-	}
-
-	if err := s.lifecycleManager.Start(executionID); err != nil {
-		writeAPIError(w, http.StatusInternalServerError, APIError{
-			Code:    ErrorCodeInternal,
-			Message: "failed to start execution",
-		})
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(
 		r.Context(),
 		s.policy.MaxExecutionDuration,
 	)
 	defer cancel()
 
-	result, err := s.executor.Execute(
+	result, err := s.executionService.Execute(
 		ctx,
 		executionID,
 		scenario,
@@ -218,13 +187,6 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) &&
 		!errors.Is(r.Context().Err(), context.DeadlineExceeded) {
-		if lifecycleErr := s.lifecycleManager.Fail(executionID, context.DeadlineExceeded); lifecycleErr != nil {
-			writeAPIError(w, http.StatusInternalServerError, APIError{
-				Code:    ErrorCodeInternal,
-				Message: "internal server error",
-			})
-			return
-		}
 		apiErr := APIError{
 			Code:    ErrorCodeExecutionTimeout,
 			Message: "execution timed out",
@@ -234,42 +196,12 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		if r.Context().Err() != nil {
-			if lifecycleErr := s.lifecycleManager.Cancel(executionID); lifecycleErr != nil {
-				writeAPIError(w, http.StatusInternalServerError, APIError{
-					Code:    ErrorCodeInternal,
-					Message: "internal server error",
-				})
-				return
-			}
-		} else if lifecycleErr := s.lifecycleManager.Fail(executionID, err); lifecycleErr != nil {
-			writeAPIError(w, http.StatusInternalServerError, APIError{
-				Code:    ErrorCodeInternal,
-				Message: "internal server error",
-			})
-			return
-		}
 		apiErr := classifyExecutionError(err)
 		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
 		return
 	}
 
 	if r.Context().Err() != nil {
-		if lifecycleErr := s.lifecycleManager.Cancel(executionID); lifecycleErr != nil {
-			writeAPIError(w, http.StatusInternalServerError, APIError{
-				Code:    ErrorCodeInternal,
-				Message: "internal server error",
-			})
-			return
-		}
-		return
-	}
-
-	if err := s.lifecycleManager.Complete(executionID, result); err != nil {
-		writeAPIError(w, http.StatusInternalServerError, APIError{
-			Code:    ErrorCodeInternal,
-			Message: "internal server error",
-		})
 		return
 	}
 
