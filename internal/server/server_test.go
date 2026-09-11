@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
@@ -29,9 +31,11 @@ type fakeExecutor struct {
 }
 
 type blockingExecutor struct {
-	started chan struct{}
-	release chan struct{}
-	err     error
+	mu          sync.Mutex
+	started     chan struct{}
+	release     chan struct{}
+	err         error
+	executionID string
 }
 
 func (e *blockingExecutor) Execute(
@@ -39,6 +43,9 @@ func (e *blockingExecutor) Execute(
 	executionID string,
 	scenario demo.Scenario,
 ) (execution.Result, error) {
+	e.mu.Lock()
+	e.executionID = executionID
+	e.mu.Unlock()
 	e.started <- struct{}{}
 	select {
 	case <-e.release:
@@ -50,6 +57,12 @@ func (e *blockingExecutor) Execute(
 		ExecutionID: executionID,
 		Scenario:    scenario,
 	}, e.err
+}
+
+func (e *blockingExecutor) ID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.executionID
 }
 
 func (f *fakeExecutor) Execute(
@@ -80,7 +93,7 @@ func (f *fakeExecutor) Execute(
 func TestServerHealth(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -157,7 +170,7 @@ func TestServerRun(t *testing.T) {
 		},
 	}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -278,7 +291,7 @@ func TestServerRunDefaultsRequestCount(t *testing.T) {
 		},
 	}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -331,7 +344,7 @@ func TestServerRunDefaultsRequestCount(t *testing.T) {
 func TestServerRunRejectsInvalidScenario(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -394,7 +407,7 @@ func TestServerRunRejectsInvalidService(t *testing.T) {
 func TestServerRunRejectsInvalidJSON(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -435,7 +448,7 @@ func TestServerRunRejectsInvalidJSON(t *testing.T) {
 func TestServerMethodNotAllowed(t *testing.T) {
 	executor := &fakeExecutor{}
 
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -478,7 +491,7 @@ func TestServerExecutorError(t *testing.T) {
 	executionPolicy := policy.Default()
 	executionPolicy.MaxExecutionDuration = 20 * time.Millisecond
 
-	server, err := New(executor, executionPolicy)
+	server, err := New(executor, executionPolicy, ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -532,7 +545,7 @@ func TestServerPolicyRejection(t *testing.T) {
 	executionPolicy := policy.Default()
 	executionPolicy.MaxRequests = 1
 
-	server, err := New(executor, executionPolicy)
+	server, err := New(executor, executionPolicy, ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -620,9 +633,169 @@ func TestServerInternalError(t *testing.T) {
 	assertAPIError(t, resp, ErrorCodeInternal, "internal server error")
 }
 
+func TestServerLifecycleCompletesWithExecutionResult(t *testing.T) {
+	executor := &fakeExecutor{
+		result: execution.Result{
+			Scenario: demo.Scenario{
+				Service:      demo.ServiceUsers,
+				Operation:    demo.OperationGetUser,
+				RequestCount: 1,
+			},
+			Requests: []execution.RequestResult{{
+				Index:      0,
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+			}},
+		},
+	}
+	manager := newTestLifecycleManager(t)
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	executionID := executor.executionID
+	snapshot, ok := manager.Get(executionID)
+	if !ok {
+		t.Fatalf("lifecycle execution %q not found", executionID)
+	}
+	if snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusCompleted)
+	}
+	if snapshot.Result == nil {
+		t.Fatal("lifecycle result is nil")
+	}
+	if snapshot.Result.ExecutionID != executionID {
+		t.Fatalf("stored execution ID = %q, want %q", snapshot.Result.ExecutionID, executionID)
+	}
+	if len(snapshot.Result.Requests) != 1 || snapshot.Result.Requests[0].StatusCode != http.StatusOK {
+		t.Fatalf("stored result = %+v", snapshot.Result)
+	}
+}
+
+func TestServerLifecycleFailsOnExecutorError(t *testing.T) {
+	executor := &fakeExecutor{err: errors.New("executor failed")}
+	manager := newTestLifecycleManager(t)
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+
+	executionID := executor.executionID
+	snapshot, ok := manager.Get(executionID)
+	if !ok {
+		t.Fatalf("lifecycle execution %q not found", executionID)
+	}
+	if snapshot.Status != lifecycle.StatusFailed {
+		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusFailed)
+	}
+	if snapshot.Error != "executor failed" {
+		t.Fatalf("lifecycle error = %q, want %q", snapshot.Error, "executor failed")
+	}
+}
+
+func TestServerLifecycleFailsOnPolicyTimeout(t *testing.T) {
+	executor := &blockingExecutor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	executionPolicy := policy.Default()
+	executionPolicy.MaxExecutionDuration = 20 * time.Millisecond
+	manager := newTestLifecycleManager(t)
+	server, err := New(executor, executionPolicy, ratelimit.NewDefault(), manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusGatewayTimeout)
+	}
+
+	executionID := executor.ID()
+	snapshot, ok := manager.Get(executionID)
+	if !ok {
+		t.Fatalf("lifecycle execution %q not found", executionID)
+	}
+	if snapshot.Status != lifecycle.StatusFailed {
+		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusFailed)
+	}
+
+	if snapshot.Error != context.DeadlineExceeded.Error() {
+		t.Fatalf(
+			"lifecycle error = %q, want %q",
+			snapshot.Error,
+			context.DeadlineExceeded.Error(),
+		)
+	}
+}
+
+func TestServerLifecycleCancelsOnRequestCancellation(t *testing.T) {
+	executor := &blockingExecutor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	manager := newTestLifecycleManager(t)
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/run",
+		strings.NewReader(validRequestBody()),
+	).WithContext(requestContext)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	go func() {
+		server.Handler().ServeHTTP(response, req)
+		close(done)
+	}()
+
+	<-executor.started
+	cancel()
+	<-done
+
+	executionID := executor.ID()
+	snapshot, ok := manager.Get(executionID)
+	if !ok {
+		t.Fatalf("lifecycle execution %q not found", executionID)
+	}
+	if snapshot.Status != lifecycle.StatusCancelled {
+		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusCancelled)
+	}
+
+	if snapshot.Error != "execution cancelled" {
+		t.Fatalf(
+			"lifecycle error = %q, want %q",
+			snapshot.Error,
+			"execution cancelled",
+		)
+	}
+
+	if response.Code == http.StatusGatewayTimeout {
+		t.Fatal("request cancellation must not return execution timeout")
+	}
+}
+
 func TestServerRateLimitRejectsSameClient(t *testing.T) {
 	executor := &fakeExecutor{}
-	server, err := New(executor, policy.Default(), ratelimit.New(1, 1, time.Hour))
+	server, err := New(executor, policy.Default(), ratelimit.New(1, 1, time.Hour), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -647,7 +820,7 @@ func TestServerRateLimitUsesIndependentClientIPs(t *testing.T) {
 		started: make(chan struct{}, 2),
 		release: make(chan struct{}),
 	}
-	server, err := New(executor, policy.Default(), ratelimit.New(1, 100, time.Hour))
+	server, err := New(executor, policy.Default(), ratelimit.New(1, 100, time.Hour), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -676,6 +849,7 @@ func TestServerRateLimitReleasesSlotAfterExecutionError(t *testing.T) {
 		executor,
 		policy.Default(),
 		ratelimit.New(1, 100, time.Hour),
+		newTestLifecycleManager(t),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -703,7 +877,7 @@ func TestServerRateLimitReleasesSlotAfterExecutionError(t *testing.T) {
 }
 
 func TestServerDefaultLimiterIsSharedByHandler(t *testing.T) {
-	server, err := New(&fakeExecutor{}, policy.Default())
+	server, err := New(&fakeExecutor{}, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -798,7 +972,7 @@ func TestServerMethodNotAllowedReturnsJSONError(t *testing.T) {
 
 func newTestServer(t *testing.T, executor Executor) *httptest.Server {
 	t.Helper()
-	server, err := New(executor, policy.Default())
+	server, err := New(executor, policy.Default(), ratelimit.NewDefault(), newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -807,11 +981,20 @@ func newTestServer(t *testing.T, executor Executor) *httptest.Server {
 
 func newTestServerWithLimiter(t *testing.T, executor Executor, limiter *ratelimit.Limiter) *httptest.Server {
 	t.Helper()
-	server, err := New(executor, policy.Default(), limiter)
+	server, err := New(executor, policy.Default(), limiter, newTestLifecycleManager(t))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
 	return httptest.NewServer(server.Handler())
+}
+
+func newTestLifecycleManager(t *testing.T) *lifecycle.Manager {
+	t.Helper()
+	manager, err := lifecycle.New(10)
+	if err != nil {
+		t.Fatalf("lifecycle.New() error: %v", err)
+	}
+	return manager
 }
 
 func validRequestBody() string {
@@ -884,6 +1067,7 @@ func TestServerRateLimitRejectsConcurrentExecutionForSameClient(t *testing.T) {
 		executor,
 		policy.Default(),
 		ratelimit.New(1, 100, time.Hour),
+		newTestLifecycleManager(t),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -947,6 +1131,7 @@ func TestServerPolicyRejectionDoesNotConsumeRateLimit(t *testing.T) {
 		executor,
 		executionPolicy,
 		limiter,
+		newTestLifecycleManager(t),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)

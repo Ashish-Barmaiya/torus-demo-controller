@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/config"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/request"
@@ -20,6 +21,8 @@ import (
 )
 
 const shutdownTimeout = 5 * time.Second
+
+const maxRetainedExecutions = 100
 
 func main() {
 	cfg, err := config.Load()
@@ -53,10 +56,16 @@ func main() {
 		cfg.RateLimitWindow,
 	)
 
+	lifecycleManager, err := lifecycle.New(maxRetainedExecutions)
+	if err != nil {
+		log.Fatalf("create lifecycle manager: %v", err)
+	}
+
 	app, err := server.New(
 		executor,
 		executionPolicy,
 		limiter,
+		lifecycleManager,
 	)
 	if err != nil {
 		log.Fatalf("create server: %v", err)

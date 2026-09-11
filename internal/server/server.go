@@ -13,6 +13,7 @@ import (
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
@@ -57,28 +58,33 @@ type apiErrorBody struct {
 }
 
 type Server struct {
-	executor Executor
-	policy   policy.Policy
-	limiter  *ratelimit.Limiter
+	executor         Executor
+	policy           policy.Policy
+	limiter          *ratelimit.Limiter
+	lifecycleManager *lifecycle.Manager
 }
 
-func New(executor Executor, executionPolicy policy.Policy, opts ...*ratelimit.Limiter) (*Server, error) {
+func New(
+	executor Executor,
+	executionPolicy policy.Policy,
+	limiter *ratelimit.Limiter,
+	lifecycleManager *lifecycle.Manager,
+) (*Server, error) {
 	if executor == nil {
 		return nil, fmt.Errorf("executor must not be nil")
 	}
-
-	var limiter *ratelimit.Limiter
-	if len(opts) > 0 {
-		limiter = opts[0]
-	}
 	if limiter == nil {
-		limiter = ratelimit.NewDefault()
+		return nil, fmt.Errorf("limiter must not be nil")
+	}
+	if lifecycleManager == nil {
+		return nil, fmt.Errorf("lifecycle manager must not be nil")
 	}
 
 	return &Server{
-		executor: executor,
-		policy:   executionPolicy,
-		limiter:  limiter,
+		executor:         executor,
+		policy:           executionPolicy,
+		limiter:          limiter,
+		lifecycleManager: lifecycleManager,
 	}, nil
 }
 
@@ -182,6 +188,22 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, err := s.lifecycleManager.Create(executionID, scenario); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "failed to create execution",
+		})
+		return
+	}
+
+	if err := s.lifecycleManager.Start(executionID); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "failed to start execution",
+		})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(
 		r.Context(),
 		s.policy.MaxExecutionDuration,
@@ -196,6 +218,13 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) &&
 		!errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+		if lifecycleErr := s.lifecycleManager.Fail(executionID, context.DeadlineExceeded); lifecycleErr != nil {
+			writeAPIError(w, http.StatusInternalServerError, APIError{
+				Code:    ErrorCodeInternal,
+				Message: "internal server error",
+			})
+			return
+		}
 		apiErr := APIError{
 			Code:    ErrorCodeExecutionTimeout,
 			Message: "execution timed out",
@@ -205,8 +234,42 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if r.Context().Err() != nil {
+			if lifecycleErr := s.lifecycleManager.Cancel(executionID); lifecycleErr != nil {
+				writeAPIError(w, http.StatusInternalServerError, APIError{
+					Code:    ErrorCodeInternal,
+					Message: "internal server error",
+				})
+				return
+			}
+		} else if lifecycleErr := s.lifecycleManager.Fail(executionID, err); lifecycleErr != nil {
+			writeAPIError(w, http.StatusInternalServerError, APIError{
+				Code:    ErrorCodeInternal,
+				Message: "internal server error",
+			})
+			return
+		}
 		apiErr := classifyExecutionError(err)
 		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
+		return
+	}
+
+	if r.Context().Err() != nil {
+		if lifecycleErr := s.lifecycleManager.Cancel(executionID); lifecycleErr != nil {
+			writeAPIError(w, http.StatusInternalServerError, APIError{
+				Code:    ErrorCodeInternal,
+				Message: "internal server error",
+			})
+			return
+		}
+		return
+	}
+
+	if err := s.lifecycleManager.Complete(executionID, result); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "internal server error",
+		})
 		return
 	}
 
