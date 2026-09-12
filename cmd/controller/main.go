@@ -71,6 +71,7 @@ func main() {
 		executionService,
 		executionPolicy,
 		limiter,
+		lifecycleManager,
 	)
 	if err != nil {
 		log.Fatalf("create server: %v", err)

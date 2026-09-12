@@ -118,6 +118,185 @@ func (s failingStarter) StartWithCompletion(string, demo.Scenario, time.Duration
 	return s.err
 }
 
+func TestServerExecutionStatusEndpoint(t *testing.T) {
+	t.Run("unknown execution", func(t *testing.T) {
+		server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+		response := serveGetExecution(server.Handler(), "missing-exec")
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+		}
+		assertRecorderAPIError(t, response, ErrorCodeExecutionNotFound, "execution not found")
+	})
+
+	t.Run("created", func(t *testing.T) {
+		server, manager, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+		executionID := "exec_created"
+		_, err := manager.Create(executionID, demo.Scenario{Service: demo.ServiceUsers, Operation: demo.OperationGetUser, Simulation: demo.SimulationNormal})
+		if err != nil {
+			t.Fatalf("manager.Create() error: %v", err)
+		}
+		response := serveGetExecution(server.Handler(), executionID)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+		}
+		var payload executionResponse
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Status != lifecycle.StatusCreated {
+			t.Fatalf("status = %q, want %q", payload.Status, lifecycle.StatusCreated)
+		}
+		if payload.Result != nil {
+			t.Fatal("result = non-nil, want nil for created execution")
+		}
+	})
+
+	t.Run("running", func(t *testing.T) {
+		executor := &fakeExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
+		server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.started
+		executionID := executor.ID()
+		statusResponse := serveGetExecution(server.Handler(), executionID)
+		if statusResponse.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", statusResponse.Code, http.StatusOK)
+		}
+		var payload executionResponse
+		if err := json.NewDecoder(statusResponse.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Status != lifecycle.StatusRunning {
+			t.Fatalf("status = %q, want %q", payload.Status, lifecycle.StatusRunning)
+		}
+		if payload.Result != nil {
+			t.Fatal("result = non-nil, want nil for running execution")
+		}
+		close(executor.release)
+		waitForLifecycle(t, observer)
+		if snapshot, ok := manager.Get(executionID); !ok || snapshot.Status != lifecycle.StatusCompleted {
+			t.Fatalf("snapshot = %+v, ok=%v; want completed", snapshot, ok)
+		}
+	})
+
+	t.Run("completed", func(t *testing.T) {
+		executor := &fakeExecutor{
+			result: execution.Result{
+				Requests: []execution.RequestResult{{RequestID: "req_1", Index: 0, StatusCode: 200}},
+			},
+			finished: make(chan struct{}),
+		}
+		server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.finished
+		waitForLifecycle(t, observer)
+		executionID := executor.ID()
+		statusResponse := serveGetExecution(server.Handler(), executionID)
+		if statusResponse.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", statusResponse.Code, http.StatusOK)
+		}
+		var payload executionResponse
+		if err := json.NewDecoder(statusResponse.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Status != lifecycle.StatusCompleted {
+			t.Fatalf("status = %q, want %q", payload.Status, lifecycle.StatusCompleted)
+		}
+		if payload.Result == nil {
+			t.Fatal("result = nil, want execution result")
+		}
+		if payload.Result.ExecutionID != executionID {
+			t.Fatalf("result.ExecutionID = %q, want %q", payload.Result.ExecutionID, executionID)
+		}
+		if len(payload.Result.Requests) != 1 || payload.Result.Requests[0].RequestID != "req_1" {
+			t.Fatalf("result requests = %+v, want preserved request IDs", payload.Result.Requests)
+		}
+		if _, ok := manager.Get(executionID); !ok {
+			t.Fatal("manager.Get() returned not found for completed execution")
+		}
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		executor := &fakeExecutor{err: errors.New("executor failed"), finished: make(chan struct{})}
+		server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.finished
+		waitForLifecycle(t, observer)
+		executionID := executor.ID()
+		statusResponse := serveGetExecution(server.Handler(), executionID)
+		if statusResponse.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", statusResponse.Code, http.StatusOK)
+		}
+		var payload executionResponse
+		if err := json.NewDecoder(statusResponse.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Status != lifecycle.StatusFailed {
+			t.Fatalf("status = %q, want %q", payload.Status, lifecycle.StatusFailed)
+		}
+		if payload.Error == "" {
+			t.Fatal("error = empty string, want execution failure message")
+		}
+		if _, ok := manager.Get(executionID); !ok {
+			t.Fatal("manager.Get() returned not found for failed execution")
+		}
+	})
+
+	t.Run("cancelled", func(t *testing.T) {
+		executor := &fakeExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
+		server, manager, _ := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.started
+		executionID := executor.ID()
+		if err := manager.Cancel(executionID); err != nil {
+			t.Fatalf("manager.Cancel() error: %v", err)
+		}
+		statusResponse := serveGetExecution(server.Handler(), executionID)
+		if statusResponse.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", statusResponse.Code, http.StatusOK)
+		}
+		var payload executionResponse
+		if err := json.NewDecoder(statusResponse.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Status != lifecycle.StatusCancelled {
+			t.Fatalf("status = %q, want %q", payload.Status, lifecycle.StatusCancelled)
+		}
+		close(executor.release)
+	})
+
+	t.Run("method not allowed", func(t *testing.T) {
+		server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+		response := serveExecutionMethod(server.Handler(), http.MethodPost, "exec_123")
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+		}
+		assertRecorderAPIError(t, response, ErrorCodeMethodNotAllowed, "method not allowed")
+	})
+
+	t.Run("malformed path", func(t *testing.T) {
+		server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+		for _, path := range []string{"/api/v1/executions", "/api/v1/executions/", "/api/v1/executions/foo/bar"} {
+			response := serveCustomGet(server.Handler(), path)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("path %q: status = %d, want %d", path, response.Code, http.StatusNotFound)
+			}
+			assertRecorderAPIError(t, response, ErrorCodeExecutionNotFound, "execution not found")
+		}
+	})
+}
+
 func TestServerRunReturnsAcceptedWithMinimalResponse(t *testing.T) {
 	executor := &fakeExecutor{
 		started:  make(chan struct{}, 1),
@@ -269,7 +448,11 @@ func TestServerCompletedEmbeddedFailuresReturnAccepted(t *testing.T) {
 }
 
 func TestServerStartFailureReturnsInternalError(t *testing.T) {
-	server, err := New(failingStarter{err: errors.New("start failed")}, policy.Default(), ratelimit.New(1, 100, time.Hour))
+	manager, err := lifecycle.New(10)
+	if err != nil {
+		t.Fatalf("lifecycle.New() error: %v", err)
+	}
+	server, err := New(failingStarter{err: errors.New("start failed")}, policy.Default(), ratelimit.New(1, 100, time.Hour), manager)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -351,7 +534,7 @@ func newTestServer(t *testing.T, executor executionservice.Executor, executionPo
 	if err != nil {
 		t.Fatalf("executionservice.New() error: %v", err)
 	}
-	server, err := New(service, executionPolicy, limiter)
+	server, err := New(service, executionPolicy, limiter, manager)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -364,6 +547,27 @@ func serveRun(handler http.Handler, remoteAddr string) *httptest.ResponseRecorde
 	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
+	return response
+}
+
+func serveGetExecution(handler http.Handler, executionID string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/executions/"+executionID, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func serveExecutionMethod(handler http.Handler, method, executionID string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "/api/v1/executions/"+executionID, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func serveCustomGet(handler http.Handler, path string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
 	return response
 }
 

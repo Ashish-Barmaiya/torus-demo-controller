@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
 )
@@ -17,14 +19,15 @@ import (
 type ErrorCode string
 
 const (
-	ErrorCodeInvalidJSON      ErrorCode = "INVALID_JSON"
-	ErrorCodeInvalidScenario  ErrorCode = "INVALID_SCENARIO"
-	ErrorCodePolicyRejected   ErrorCode = "POLICY_REJECTED"
-	ErrorCodeRateLimited      ErrorCode = "RATE_LIMITED"
-	ErrorCodeExecutionTimeout ErrorCode = "EXECUTION_TIMEOUT"
-	ErrorCodeUpstreamError    ErrorCode = "UPSTREAM_ERROR"
-	ErrorCodeInternal         ErrorCode = "INTERNAL_ERROR"
-	ErrorCodeMethodNotAllowed ErrorCode = "METHOD_NOT_ALLOWED"
+	ErrorCodeInvalidJSON       ErrorCode = "INVALID_JSON"
+	ErrorCodeInvalidScenario   ErrorCode = "INVALID_SCENARIO"
+	ErrorCodePolicyRejected    ErrorCode = "POLICY_REJECTED"
+	ErrorCodeRateLimited       ErrorCode = "RATE_LIMITED"
+	ErrorCodeExecutionTimeout  ErrorCode = "EXECUTION_TIMEOUT"
+	ErrorCodeUpstreamError     ErrorCode = "UPSTREAM_ERROR"
+	ErrorCodeInternal          ErrorCode = "INTERNAL_ERROR"
+	ErrorCodeMethodNotAllowed  ErrorCode = "METHOD_NOT_ALLOWED"
+	ErrorCodeExecutionNotFound ErrorCode = "EXECUTION_NOT_FOUND"
 )
 
 type APIError struct {
@@ -47,6 +50,7 @@ type apiErrorBody struct {
 
 type Server struct {
 	executionService ExecutionStarter
+	manager          *lifecycle.Manager
 	policy           policy.Policy
 	limiter          *ratelimit.Limiter
 }
@@ -64,6 +68,7 @@ func New(
 	executionService ExecutionStarter,
 	executionPolicy policy.Policy,
 	limiter *ratelimit.Limiter,
+	manager *lifecycle.Manager,
 ) (*Server, error) {
 	if executionService == nil {
 		return nil, fmt.Errorf("execution service must not be nil")
@@ -71,9 +76,13 @@ func New(
 	if limiter == nil {
 		return nil, fmt.Errorf("limiter must not be nil")
 	}
+	if manager == nil {
+		return nil, fmt.Errorf("lifecycle manager must not be nil")
+	}
 
 	return &Server{
 		executionService: executionService,
+		manager:          manager,
 		policy:           executionPolicy,
 		limiter:          limiter,
 	}, nil
@@ -84,6 +93,8 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/run", s.handleRun)
+	mux.HandleFunc("/api/v1/executions/", s.handleExecutionStatus)
+	mux.HandleFunc("/api/v1/executions", s.handleExecutionStatus)
 
 	return mux
 }
@@ -104,6 +115,97 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 type startResponse struct {
 	ExecutionID string `json:"execution_id"`
+}
+
+type executionResponse struct {
+	ExecutionID string            `json:"execution_id"`
+	Scenario    demo.Scenario     `json:"scenario"`
+	Status      lifecycle.Status  `json:"status"`
+	CreatedAt   time.Time         `json:"created_at"`
+	StartedAt   *time.Time        `json:"started_at"`
+	CompletedAt *time.Time        `json:"completed_at"`
+	Result      *execution.Result `json:"result"`
+	Error       string            `json:"error"`
+}
+
+func (s *Server) handleExecutionStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, APIError{
+			Code:    ErrorCodeMethodNotAllowed,
+			Message: "method not allowed",
+		})
+		return
+	}
+
+	executionID, ok := s.parseExecutionID(r)
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, APIError{
+			Code:    ErrorCodeExecutionNotFound,
+			Message: "execution not found",
+		})
+		return
+	}
+
+	snapshot, found := s.manager.Get(executionID)
+	if !found {
+		writeAPIError(w, http.StatusNotFound, APIError{
+			Code:    ErrorCodeExecutionNotFound,
+			Message: "execution not found",
+		})
+		return
+	}
+
+	response := executionResponse{
+		ExecutionID: snapshot.ID,
+		Scenario:    snapshot.Scenario,
+		Status:      snapshot.Status,
+		CreatedAt:   snapshot.CreatedAt,
+		Result:      snapshot.Result,
+		Error:       snapshot.Error,
+	}
+
+	if !snapshot.StartedAt.IsZero() {
+		startedAt := snapshot.StartedAt
+		response.StartedAt = &startedAt
+	}
+	if !snapshot.CompletedAt.IsZero() {
+		completedAt := snapshot.CompletedAt
+		response.CompletedAt = &completedAt
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) parseExecutionID(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+
+	path := r.URL.Path
+	prefix := "/api/v1/executions"
+
+	if path == prefix || path == prefix+"/" {
+		return "", false
+	}
+
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+
+	remainder := strings.TrimPrefix(path, prefix)
+	if remainder == "" || remainder == "/" {
+		return "", false
+	}
+	if !strings.HasPrefix(remainder, "/") {
+		return "", false
+	}
+
+	segments := strings.Split(strings.Trim(remainder, "/"), "/")
+	if len(segments) != 1 || segments[0] == "" {
+		return "", false
+	}
+
+	return segments[0], true
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -210,6 +312,8 @@ func apiErrorStatus(apiErr APIError) int {
 		return http.StatusBadGateway
 	case ErrorCodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
+	case ErrorCodeExecutionNotFound:
+		return http.StatusNotFound
 	default:
 		return http.StatusInternalServerError
 	}
