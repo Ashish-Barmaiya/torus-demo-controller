@@ -417,7 +417,7 @@ func TestStartRejectsInvalidTimeout(t *testing.T) {
 	}
 
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if err := service.Start(context.Background(), "exec_1", testScenario(), timeout); err == nil {
+		if err := service.Start("exec_1", testScenario(), timeout); err == nil {
 			t.Fatalf("Start() with timeout %v should fail", timeout)
 		}
 	}
@@ -437,7 +437,7 @@ func TestStartReturnsBeforeExecutorCompletionAndCompletesAsync(t *testing.T) {
 		t.Fatalf("New() error: %v", err)
 	}
 
-	if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+	if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
 
@@ -473,7 +473,7 @@ func TestStartReturnsBeforeExecutorCompletionAndCompletesAsync(t *testing.T) {
 	}
 }
 
-func TestStartParentCancellationDoesNotCancelExecution(t *testing.T) {
+func TestStartExecutionLifetimeIsIndependent(t *testing.T) {
 	manager := testManager(t)
 	lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
 	executor := &fakeExecutor{
@@ -482,19 +482,11 @@ func TestStartParentCancellationDoesNotCancelExecution(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	service, _ := New(executor, lifecycleRecorder)
-	parent, cancelParent := context.WithCancel(context.Background())
 
-	if err := service.Start(parent, "exec_1", testScenario(), time.Second); err != nil {
+	if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
 	<-executor.started
-	cancelParent()
-
-	select {
-	case <-lifecycleRecorder.done:
-		t.Fatal("parent cancellation terminated execution")
-	case <-time.After(20 * time.Millisecond):
-	}
 
 	close(executor.release)
 	select {
@@ -516,7 +508,7 @@ func TestStartExecutorFailureAndTimeout(t *testing.T) {
 		executor := &fakeExecutor{err: errors.New("executor failed")}
 		service, _ := New(executor, lifecycleRecorder)
 
-		if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+		if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
 			t.Fatalf("Start() error: %v", err)
 		}
 		<-lifecycleRecorder.done
@@ -536,7 +528,7 @@ func TestStartExecutorFailureAndTimeout(t *testing.T) {
 		}
 		service, _ := New(executor, lifecycleRecorder)
 
-		if err := service.Start(context.Background(), "exec_1", testScenario(), time.Millisecond); err != nil {
+		if err := service.Start("exec_1", testScenario(), time.Millisecond); err != nil {
 			t.Fatalf("Start() error: %v", err)
 		}
 		<-executor.started
@@ -561,7 +553,7 @@ func TestStartCompletesHTTPAndRequestFailures(t *testing.T) {
 			manager := testManager(t)
 			lifecycleRecorder := &asyncLifecycle{manager: manager, done: make(chan struct{})}
 			service, _ := New(&fakeExecutor{result: result}, lifecycleRecorder)
-			if err := service.Start(context.Background(), "exec_1", testScenario(), time.Second); err != nil {
+			if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
 				t.Fatalf("Start() error: %v", err)
 			}
 			<-lifecycleRecorder.done
@@ -585,7 +577,7 @@ func TestStartRunsConcurrentExecutionsIndependently(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		id := fmt.Sprintf("exec_%d", i)
-		if err := service.Start(context.Background(), id, testScenario(), time.Second); err != nil {
+		if err := service.Start(id, testScenario(), time.Second); err != nil {
 			t.Fatalf("Start(%s) error: %v", id, err)
 		}
 	}

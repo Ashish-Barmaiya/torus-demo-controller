@@ -65,10 +65,27 @@ func (s *Service) Execute(
 }
 
 func (s *Service) Start(
-	_ context.Context,
 	executionID string,
 	scenario demo.Scenario,
 	timeout time.Duration,
+) error {
+	return s.start(executionID, scenario, timeout, nil)
+}
+
+func (s *Service) StartWithCompletion(
+	executionID string,
+	scenario demo.Scenario,
+	timeout time.Duration,
+	onCompletion func(),
+) error {
+	return s.start(executionID, scenario, timeout, onCompletion)
+}
+
+func (s *Service) start(
+	executionID string,
+	scenario demo.Scenario,
+	timeout time.Duration,
+	onCompletion func(),
 ) error {
 	if timeout <= 0 {
 		return fmt.Errorf("execution timeout must be greater than zero")
@@ -85,6 +102,9 @@ func (s *Service) Start(
 	executionCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	go func() {
 		defer cancel()
+		if onCompletion != nil {
+			defer onCompletion()
+		}
 		_, _ = s.executeAndRecord(executionCtx, executionID, scenario)
 	}()
 

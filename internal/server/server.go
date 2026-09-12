@@ -1,9 +1,7 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
-	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/executionservice"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/ratelimit"
@@ -49,13 +46,22 @@ type apiErrorBody struct {
 }
 
 type Server struct {
-	executionService *executionservice.Service
+	executionService ExecutionStarter
 	policy           policy.Policy
 	limiter          *ratelimit.Limiter
 }
 
+type ExecutionStarter interface {
+	StartWithCompletion(
+		string,
+		demo.Scenario,
+		time.Duration,
+		func(),
+	) error
+}
+
 func New(
-	executionService *executionservice.Service,
+	executionService ExecutionStarter,
 	executionPolicy policy.Policy,
 	limiter *ratelimit.Limiter,
 ) (*Server, error) {
@@ -96,21 +102,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type runResponse struct {
-	ExecutionID   string           `json:"execution_id"`
-	Scenario      demo.Scenario    `json:"scenario"`
-	TotalDuration time.Duration    `json:"total_duration"`
-	Requests      []requestSummary `json:"requests"`
-}
-
-type requestSummary struct {
-	RequestID  string        `json:"request_id"`
-	Index      int           `json:"index"`
-	StatusCode int           `json:"status_code"`
-	Status     string        `json:"status"`
-	BodySize   int64         `json:"body_size"`
-	Duration   time.Duration `json:"duration"`
-	Error      string        `json:"error,omitempty"`
+type startResponse struct {
+	ExecutionID string `json:"execution_id"`
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -162,10 +155,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer s.limiter.Done(client)
 
 	executionID, err := identity.NewExecutionID()
 	if err != nil {
+		s.limiter.Done(client)
 		writeAPIError(w, http.StatusInternalServerError, APIError{
 			Code:    ErrorCodeInternal,
 			Message: "failed to create execution ID",
@@ -173,58 +166,24 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(
-		r.Context(),
-		s.policy.MaxExecutionDuration,
-	)
-	defer cancel()
-
-	result, err := s.executionService.Execute(
-		ctx,
+	err = s.executionService.StartWithCompletion(
 		executionID,
 		scenario,
+		s.policy.MaxExecutionDuration,
+		func() {
+			s.limiter.Done(client)
+		},
 	)
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) &&
-		!errors.Is(r.Context().Err(), context.DeadlineExceeded) {
-		apiErr := APIError{
-			Code:    ErrorCodeExecutionTimeout,
-			Message: "execution timed out",
-		}
-		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
-		return
-	}
-
 	if err != nil {
-		apiErr := classifyExecutionError(err)
-		writeAPIError(w, apiErrorStatus(apiErr), apiErr)
+		s.limiter.Done(client)
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "internal server error",
+		})
 		return
 	}
 
-	if r.Context().Err() != nil {
-		return
-	}
-
-	response := runResponse{
-		ExecutionID:   result.ExecutionID,
-		Scenario:      result.Scenario,
-		TotalDuration: result.TotalDuration,
-		Requests:      make([]requestSummary, len(result.Requests)),
-	}
-
-	for i, requestResult := range result.Requests {
-		response.Requests[i] = requestSummary{
-			RequestID:  requestResult.RequestID,
-			Index:      requestResult.Index,
-			StatusCode: requestResult.StatusCode,
-			Status:     requestResult.Status,
-			BodySize:   requestResult.BodySize,
-			Duration:   requestResult.Duration,
-			Error:      requestResult.Error,
-		}
-	}
-
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusAccepted, startResponse{ExecutionID: executionID})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -279,18 +238,4 @@ func clientKey(r *http.Request) string {
 	}
 
 	return r.RemoteAddr
-}
-
-func classifyExecutionError(err error) APIError {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return APIError{
-			Code:    ErrorCodeExecutionTimeout,
-			Message: "execution timed out",
-		}
-	}
-
-	return APIError{
-		Code:    ErrorCodeInternal,
-		Message: "internal server error",
-	}
 }

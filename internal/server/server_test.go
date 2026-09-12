@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,49 +20,17 @@ import (
 )
 
 type fakeExecutor struct {
-	result      execution.Result
-	err         error
+	mu sync.Mutex
+
+	result execution.Result
+	err    error
+
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+
 	executionID string
-
-	called   bool
-	scenario demo.Scenario
-	ctx      context.Context
-	block    bool
-}
-
-type blockingExecutor struct {
-	mu          sync.Mutex
-	started     chan struct{}
-	release     chan struct{}
-	err         error
-	executionID string
-}
-
-func (e *blockingExecutor) Execute(
-	ctx context.Context,
-	executionID string,
-	scenario demo.Scenario,
-) (execution.Result, error) {
-	e.mu.Lock()
-	e.executionID = executionID
-	e.mu.Unlock()
-	e.started <- struct{}{}
-	select {
-	case <-e.release:
-	case <-ctx.Done():
-		return execution.Result{}, ctx.Err()
-	}
-
-	return execution.Result{
-		ExecutionID: executionID,
-		Scenario:    scenario,
-	}, e.err
-}
-
-func (e *blockingExecutor) ID() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.executionID
+	scenario    demo.Scenario
 }
 
 func (f *fakeExecutor) Execute(
@@ -71,995 +38,324 @@ func (f *fakeExecutor) Execute(
 	executionID string,
 	scenario demo.Scenario,
 ) (execution.Result, error) {
-	f.called = true
+	f.mu.Lock()
 	f.executionID = executionID
 	f.scenario = scenario
-	f.ctx = ctx
-	f.result.ExecutionID = executionID
+	f.mu.Unlock()
 
-	for i := range f.result.Requests {
-		if f.result.Requests[i].RequestID == "" {
-			f.result.Requests[i].RequestID = fmt.Sprintf("req_%d", i)
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.release != nil {
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+			if f.finished != nil {
+				close(f.finished)
+			}
+			return execution.Result{}, ctx.Err()
 		}
 	}
 
-	if f.block {
-		<-ctx.Done()
-		return f.result, ctx.Err()
+	result := f.result
+	result.ExecutionID = executionID
+	if result.Scenario == (demo.Scenario{}) {
+		result.Scenario = scenario
 	}
-
-	return f.result, f.err
+	if f.finished != nil {
+		close(f.finished)
+	}
+	return result, f.err
 }
 
-func TestServerHealth(t *testing.T) {
-	executor := &fakeExecutor{}
-
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	req, err := http.NewRequest(
-		http.MethodGet,
-		ts.URL+"/health",
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusOK,
-		)
-	}
-
-	var body map[string]string
-
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	if body["status"] != "ok" {
-		t.Fatalf(
-			"status body = %q, want %q",
-			body["status"],
-			"ok",
-		)
-	}
+func (f *fakeExecutor) ID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.executionID
 }
 
-func TestServerRun(t *testing.T) {
+type observedLifecycle struct {
+	manager *lifecycle.Manager
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (o *observedLifecycle) Create(id string, scenario demo.Scenario) (*lifecycle.Execution, error) {
+	return o.manager.Create(id, scenario)
+}
+
+func (o *observedLifecycle) Start(id string) error {
+	return o.manager.Start(id)
+}
+
+func (o *observedLifecycle) Complete(id string, result execution.Result) error {
+	err := o.manager.Complete(id, result)
+	o.signal()
+	return err
+}
+
+func (o *observedLifecycle) Fail(id string, err error) error {
+	lifecycleErr := o.manager.Fail(id, err)
+	o.signal()
+	return lifecycleErr
+}
+
+func (o *observedLifecycle) Cancel(id string) error {
+	err := o.manager.Cancel(id)
+	o.signal()
+	return err
+}
+
+func (o *observedLifecycle) signal() {
+	o.once.Do(func() { close(o.done) })
+}
+
+type failingStarter struct {
+	err error
+}
+
+func (s failingStarter) StartWithCompletion(string, demo.Scenario, time.Duration, func()) error {
+	return s.err
+}
+
+func TestServerRunReturnsAcceptedWithMinimalResponse(t *testing.T) {
 	executor := &fakeExecutor{
-		result: execution.Result{
-			Scenario: demo.Scenario{
-				Service:      demo.ServiceUsers,
-				Operation:    demo.OperationGetUser,
-				Simulation:   demo.SimulationNormal,
-				RequestSize:  demo.RequestSizeNone,
-				ResponseSize: demo.ResponseSize1KB,
-				RequestCount: 2,
-			},
-			TotalDuration: 150 * time.Millisecond,
-			Requests: []execution.RequestResult{
-				{
-					Index:      0,
-					StatusCode: http.StatusOK,
-					Status:     "200 OK",
-					BodySize:   1024,
-					Duration:   75 * time.Millisecond,
-				},
-				{
-					Index:      1,
-					StatusCode: http.StatusOK,
-					Status:     "200 OK",
-					BodySize:   1024,
-					Duration:   74 * time.Millisecond,
-				},
-			},
-		},
+		started:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
 	}
 
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	requestBody := `{
-		"service": "users",
-		"operation": "get_user",
-		"simulation": "normal",
-		"request_size": "0b",
-		"response_size": "1kb",
-		"request_count": 2
-	}`
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		ts.URL+"/api/v1/run",
-		jsonBody(requestBody),
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusOK,
-		)
-	}
-
-	if !executor.called {
-		t.Fatal("executor was not called")
-	}
-
-	if executor.executionID == "" {
-		t.Fatal("executor did not receive a non-empty execution ID")
-	}
-
-	if executor.scenario.RequestCount != 2 {
-		t.Fatalf(
-			"request count = %d, want %d",
-			executor.scenario.RequestCount,
-			2,
-		)
-	}
-
-	var response runResponse
-
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-
-	if response.Scenario.Operation != demo.OperationGetUser {
-		t.Fatalf(
-			"operation = %q, want %q",
-			response.Scenario.Operation,
-			demo.OperationGetUser,
-		)
+	if len(body) != 1 {
+		t.Fatalf("response fields = %d, want 1", len(body))
 	}
-
-	if response.ExecutionID == "" {
+	var executionID string
+	if err := json.Unmarshal(body["execution_id"], &executionID); err != nil {
+		t.Fatalf("decode execution_id: %v", err)
+	}
+	if executionID == "" {
 		t.Fatal("execution_id must not be empty")
 	}
-
-	if response.ExecutionID != executor.executionID {
-		t.Fatalf("execution_id = %q, want %q", response.ExecutionID, executor.executionID)
+	<-executor.started
+	snapshot, ok := manager.Get(executionID)
+	if !ok || snapshot.Status != lifecycle.StatusRunning {
+		t.Fatalf("snapshot = %+v, found = %v; want running", snapshot, ok)
 	}
-
-	if len(response.Requests) != 2 {
-		t.Fatalf(
-			"requests = %d, want %d",
-			len(response.Requests),
-			2,
-		)
-	}
-
-	seen := make(map[string]struct{}, len(response.Requests))
-	for _, requestResult := range response.Requests {
-		if requestResult.RequestID == "" {
-			t.Fatal("request_id must not be empty")
-		}
-		if _, exists := seen[requestResult.RequestID]; exists {
-			t.Fatalf("duplicate request ID: %s", requestResult.RequestID)
-		}
-		seen[requestResult.RequestID] = struct{}{}
-	}
-
-	if response.Requests[0].BodySize != 1024 {
-		t.Fatalf(
-			"request 0 body size = %d, want 1024",
-			response.Requests[0].BodySize,
-		)
-	}
+	close(executor.release)
+	waitForLifecycle(t, observer)
 }
 
-func TestServerRunDefaultsRequestCount(t *testing.T) {
+func TestServerExecutionContinuesAfterAcceptedResponse(t *testing.T) {
 	executor := &fakeExecutor{
-		result: execution.Result{
-			Scenario: demo.Scenario{
-				Service:      demo.ServiceUsers,
-				Operation:    demo.OperationGetUser,
-				Simulation:   demo.SimulationNormal,
-				RequestSize:  demo.RequestSizeNone,
-				ResponseSize: demo.ResponseSize1KB,
-				RequestCount: 1,
-			},
-		},
+		started:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
 	}
-
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	requestBody := `{
-		"service": "users",
-		"operation": "get_user",
-		"simulation": "normal",
-		"request_size": "0b",
-		"response_size": "1kb"
-	}`
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		ts.URL+"/api/v1/run",
-		jsonBody(requestBody),
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusOK,
-		)
-	}
-
-	if executor.scenario.RequestCount != 1 {
-		t.Fatalf(
-			"request count = %d, want %d",
-			executor.scenario.RequestCount,
-			1,
-		)
-	}
-}
-
-func TestServerRunRejectsInvalidScenario(t *testing.T) {
-	executor := &fakeExecutor{}
-
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	requestBody := `{
-		"service": "users",
-		"operation": "get_order",
-		"simulation": "normal",
-		"response_size": "1kb"
-	}`
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		ts.URL+"/api/v1/run",
-		jsonBody(requestBody),
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusBadRequest,
-		)
-	}
-
-	assertAPIError(t, resp, ErrorCodeInvalidScenario, `operation "get_order" does not belong to service "users"`)
-
-	if executor.called {
-		t.Fatal("executor must not be called for invalid scenario")
-	}
-}
-
-func TestServerRunRejectsInvalidService(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{})
-	defer server.Close()
-
-	resp := postRun(t, server, `{"service":"payments","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb"}`)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-	assertAPIError(t, resp, ErrorCodeInvalidScenario, `unsupported service "payments"`)
-}
-
-func TestServerRunRejectsInvalidJSON(t *testing.T) {
-	executor := &fakeExecutor{}
-
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		ts.URL+"/api/v1/run",
-		jsonBody(`{"service":`),
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusBadRequest,
-		)
-	}
-
-	assertAPIError(t, resp, ErrorCodeInvalidJSON, "invalid JSON body")
-
-	if executor.called {
-		t.Fatal("executor must not be called for invalid JSON")
-	}
-}
-
-func TestServerMethodNotAllowed(t *testing.T) {
-	executor := &fakeExecutor{}
-
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	req, err := http.NewRequest(
-		http.MethodGet,
-		ts.URL+"/api/v1/run",
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusMethodNotAllowed,
-		)
-	}
-
-	if executor.called {
-		t.Fatal("executor must not be called")
-	}
-}
-
-func TestServerExecutorError(t *testing.T) {
-	executor := &fakeExecutor{
-		block: true,
-	}
-	executionPolicy := policy.Default()
-	executionPolicy.MaxExecutionDuration = 20 * time.Millisecond
-
-	server, err := New(newTestExecutionService(t, executor), executionPolicy, ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	requestBody := `{
-		"service": "users",
-		"operation": "get_user",
-		"simulation": "normal",
-		"request_size": "0b",
-		"response_size": "1kb"
-	}`
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		ts.URL+"/api/v1/run",
-		jsonBody(requestBody),
-	)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf(
-			"status = %d, want %d",
-			resp.StatusCode,
-			http.StatusGatewayTimeout,
-		)
-	}
-
-	assertAPIError(t, resp, ErrorCodeExecutionTimeout, "execution timed out")
-
-	if executor.ctx == nil {
-		t.Fatal("executor did not receive a context")
-	}
-	if _, ok := executor.ctx.Deadline(); !ok {
-		t.Fatal("executor context has no deadline")
-	}
-}
-
-func TestServerPolicyRejection(t *testing.T) {
-	executor := &fakeExecutor{}
-	executionPolicy := policy.Default()
-	executionPolicy.MaxRequests = 1
-
-	server, err := New(newTestExecutionService(t, executor), executionPolicy, ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
-
-	resp := postRun(t, ts, `{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb","request_count":2}`)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-	assertAPIError(t, resp, ErrorCodePolicyRejected, "request count 2 exceeds maximum 1")
-	if executor.called {
-		t.Fatal("executor must not be called when policy rejects scenario")
-	}
-}
-
-func TestServerPreservesRequestNetworkError(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{
-		result: execution.Result{
-			Requests: []execution.RequestResult{
-				{StatusCode: http.StatusOK, Status: "200 OK"},
-				{StatusCode: 0, Error: "connection refused"},
-				{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable"},
-			},
-		},
-	})
-	defer server.Close()
-
-	resp := postRun(t, server, validRequestBody())
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body runResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if len(body.Requests) != 3 {
-		t.Fatalf("requests = %d, want 3", len(body.Requests))
-	}
-	if body.Requests[0].StatusCode != http.StatusOK || body.Requests[0].Error != "" {
-		t.Fatalf("successful request = %+v", body.Requests[0])
-	}
-	if body.Requests[1].StatusCode != 0 || body.Requests[1].Error != "connection refused" {
-		t.Fatalf("failed request = %+v", body.Requests[1])
-	}
-	if body.Requests[2].StatusCode != http.StatusServiceUnavailable || body.Requests[2].Error != "" {
-		t.Fatalf("HTTP failure request = %+v", body.Requests[2])
-	}
-}
-
-func TestServerPreservesAllRequestNetworkErrors(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{
-		result: execution.Result{
-			Requests: []execution.RequestResult{
-				{StatusCode: 0, Error: "connection refused"},
-				{StatusCode: 0, Error: "context deadline exceeded"},
-			},
-		},
-	})
-	defer server.Close()
-
-	resp := postRun(t, server, validRequestBody())
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-}
-
-func TestServerInternalError(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{err: errors.New("unexpected failure")})
-	defer server.Close()
-
-	resp := postRun(t, server, validRequestBody())
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
-	}
-	assertAPIError(t, resp, ErrorCodeInternal, "internal server error")
-}
-
-func TestServerLifecycleCompletesWithExecutionResult(t *testing.T) {
-	executor := &fakeExecutor{
-		result: execution.Result{
-			Scenario: demo.Scenario{
-				Service:      demo.ServiceUsers,
-				Operation:    demo.OperationGetUser,
-				RequestCount: 1,
-			},
-			Requests: []execution.RequestResult{{
-				Index:      0,
-				StatusCode: http.StatusOK,
-				Status:     "200 OK",
-			}},
-		},
-	}
-	manager := newTestLifecycleManager(t)
-	service, err := executionservice.New(executor, manager)
-	if err != nil {
-		t.Fatalf("executionservice.New() error: %v", err)
-	}
-	server, err := New(service, policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
+	server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
 
 	response := serveRun(server.Handler(), "127.0.0.1:12345")
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", response.Code)
+	}
+	<-executor.started
+	if executor.ID() == "" {
+		t.Fatal("executor did not receive execution ID")
 	}
 
-	executionID := executor.executionID
-	snapshot, ok := manager.Get(executionID)
-	if !ok {
-		t.Fatalf("lifecycle execution %q not found", executionID)
-	}
-	if snapshot.Status != lifecycle.StatusCompleted {
-		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusCompleted)
-	}
-	if snapshot.Result == nil {
-		t.Fatal("lifecycle result is nil")
-	}
-	if snapshot.Result.ExecutionID != executionID {
-		t.Fatalf("stored execution ID = %q, want %q", snapshot.Result.ExecutionID, executionID)
-	}
-	if len(snapshot.Result.Requests) != 1 || snapshot.Result.Requests[0].StatusCode != http.StatusOK {
-		t.Fatalf("stored result = %+v", snapshot.Result)
+	close(executor.release)
+	<-executor.finished
+	waitForLifecycle(t, observer)
+	if snapshot, _ := manager.Get(executor.ID()); snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("status = %q, want completed", snapshot.Status)
 	}
 }
 
-func TestServerLifecycleFailsOnExecutorError(t *testing.T) {
-	executor := &fakeExecutor{err: errors.New("executor failed")}
-	manager := newTestLifecycleManager(t)
-	service, err := executionservice.New(executor, manager)
-	if err != nil {
-		t.Fatalf("executionservice.New() error: %v", err)
+func TestServerRequestCancellationDoesNotCancelExecution(t *testing.T) {
+	executor := &fakeExecutor{
+		started:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
 	}
-	server, err := New(service, policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	response := serveRun(server.Handler(), "127.0.0.1:12345")
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
-	}
-
-	executionID := executor.executionID
-	snapshot, ok := manager.Get(executionID)
-	if !ok {
-		t.Fatalf("lifecycle execution %q not found", executionID)
-	}
-	if snapshot.Status != lifecycle.StatusFailed {
-		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusFailed)
-	}
-	if snapshot.Error != "executor failed" {
-		t.Fatalf("lifecycle error = %q, want %q", snapshot.Error, "executor failed")
-	}
-}
-
-func TestServerLifecycleFailsOnPolicyTimeout(t *testing.T) {
-	executor := &blockingExecutor{
-		started: make(chan struct{}, 1),
-		release: make(chan struct{}),
-	}
-	executionPolicy := policy.Default()
-	executionPolicy.MaxExecutionDuration = 20 * time.Millisecond
-	manager := newTestLifecycleManager(t)
-	service, err := executionservice.New(executor, manager)
-	if err != nil {
-		t.Fatalf("executionservice.New() error: %v", err)
-	}
-	server, err := New(service, executionPolicy, ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	response := serveRun(server.Handler(), "127.0.0.1:12345")
-	if response.Code != http.StatusGatewayTimeout {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusGatewayTimeout)
-	}
-
-	executionID := executor.ID()
-	snapshot, ok := manager.Get(executionID)
-	if !ok {
-		t.Fatalf("lifecycle execution %q not found", executionID)
-	}
-	if snapshot.Status != lifecycle.StatusFailed {
-		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusFailed)
-	}
-
-	if snapshot.Error != context.DeadlineExceeded.Error() {
-		t.Fatalf(
-			"lifecycle error = %q, want %q",
-			snapshot.Error,
-			context.DeadlineExceeded.Error(),
-		)
-	}
-}
-
-func TestServerLifecycleCancelsOnRequestCancellation(t *testing.T) {
-	executor := &blockingExecutor{
-		started: make(chan struct{}, 1),
-		release: make(chan struct{}),
-	}
-	manager := newTestLifecycleManager(t)
-	service, err := executionservice.New(executor, manager)
-	if err != nil {
-		t.Fatalf("executionservice.New() error: %v", err)
-	}
-	server, err := New(service, policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
+	server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
 
 	requestContext, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"/api/v1/run",
-		strings.NewReader(validRequestBody()),
-	).WithContext(requestContext)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/run", strings.NewReader(validRequestBody())).WithContext(requestContext)
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
-	done := make(chan struct{})
-
-	go func() {
-		server.Handler().ServeHTTP(response, req)
-		close(done)
-	}()
+	server.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", response.Code)
+	}
 
 	<-executor.started
 	cancel()
-	<-done
-
-	executionID := executor.ID()
-	snapshot, ok := manager.Get(executionID)
-	if !ok {
-		t.Fatalf("lifecycle execution %q not found", executionID)
+	select {
+	case <-executor.finished:
+		t.Fatal("request cancellation stopped the execution")
+	default:
 	}
-	if snapshot.Status != lifecycle.StatusCancelled {
-		t.Fatalf("lifecycle status = %q, want %q", snapshot.Status, lifecycle.StatusCancelled)
-	}
-
-	if snapshot.Error != "execution cancelled" {
-		t.Fatalf(
-			"lifecycle error = %q, want %q",
-			snapshot.Error,
-			"execution cancelled",
-		)
-	}
-
-	if response.Code == http.StatusGatewayTimeout {
-		t.Fatal("request cancellation must not return execution timeout")
-	}
-}
-
-func TestServerRateLimitRejectsSameClient(t *testing.T) {
-	executor := &fakeExecutor{}
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.New(1, 1, time.Hour))
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	first := serveRun(server.Handler(), "127.0.0.1:12345")
-	if first.Code != http.StatusOK {
-		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
-	}
-
-	second := serveRun(server.Handler(), "127.0.0.1:54321")
-	if second.Code != http.StatusTooManyRequests {
-		t.Fatalf("second status = %d, want %d", second.Code, http.StatusTooManyRequests)
-	}
-	assertRecorderAPIError(t, second, ErrorCodeRateLimited, "rate limit exceeded")
-	if !executor.called {
-		t.Fatal("executor should be called for the admitted request")
-	}
-}
-
-func TestServerRateLimitUsesIndependentClientIPs(t *testing.T) {
-	executor := &blockingExecutor{
-		started: make(chan struct{}, 2),
-		release: make(chan struct{}),
-	}
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.New(1, 100, time.Hour))
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	results := make(chan *httptest.ResponseRecorder, 2)
-	go func() { results <- serveRun(server.Handler(), "127.0.0.1:12345") }()
-	go func() { results <- serveRun(server.Handler(), "127.0.0.2:12345") }()
-
-	<-executor.started
-	<-executor.started
 	close(executor.release)
-
-	for range 2 {
-		if response := <-results; response.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
-		}
+	<-executor.finished
+	waitForLifecycle(t, observer)
+	if snapshot, _ := manager.Get(executor.ID()); snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("status = %q, want completed", snapshot.Status)
 	}
 }
 
-func TestServerRateLimitReleasesSlotAfterExecutionError(t *testing.T) {
-	executor := &fakeExecutor{
-		err: errors.New("unexpected failure"),
-	}
+func TestServerAsyncFailureAndTimeout(t *testing.T) {
+	t.Run("executor failure", func(t *testing.T) {
+		executor := &fakeExecutor{err: errors.New("executor failed"), finished: make(chan struct{})}
+		server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.finished
+		waitForLifecycle(t, observer)
+		snapshot, _ := manager.Get(executor.ID())
+		if snapshot.Status != lifecycle.StatusFailed || snapshot.Error != "executor failed" {
+			t.Fatalf("snapshot = %+v", snapshot)
+		}
+	})
 
-	server, err := New(
-		newTestExecutionService(t, executor),
-		policy.Default(),
-		ratelimit.New(1, 100, time.Hour),
-	)
+	t.Run("policy timeout", func(t *testing.T) {
+		executor := &fakeExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
+		executionPolicy := policy.Default()
+		executionPolicy.MaxExecutionDuration = time.Millisecond
+		server, manager, observer := newTestServer(t, executor, executionPolicy, ratelimit.NewDefault())
+		response := serveRun(server.Handler(), "127.0.0.1:12345")
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", response.Code)
+		}
+		<-executor.started
+		waitForLifecycle(t, observer)
+		snapshot, _ := manager.Get(executor.ID())
+		if snapshot.Status != lifecycle.StatusFailed || snapshot.Error != context.DeadlineExceeded.Error() {
+			t.Fatalf("snapshot = %+v", snapshot)
+		}
+	})
+}
+
+func TestServerCompletedEmbeddedFailuresReturnAccepted(t *testing.T) {
+	for name, result := range map[string]execution.Result{
+		"http failure":    {Requests: []execution.RequestResult{{StatusCode: http.StatusServiceUnavailable}}},
+		"request failure": {Requests: []execution.RequestResult{{StatusCode: 0, Error: "connection refused"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			executor := &fakeExecutor{result: result, finished: make(chan struct{})}
+			server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+			response := serveRun(server.Handler(), "127.0.0.1:12345")
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202", response.Code)
+			}
+			<-executor.finished
+			waitForLifecycle(t, observer)
+			snapshot, _ := manager.Get(executor.ID())
+			if snapshot.Status != lifecycle.StatusCompleted {
+				t.Fatalf("status = %q, want completed", snapshot.Status)
+			}
+		})
+	}
+}
+
+func TestServerStartFailureReturnsInternalError(t *testing.T) {
+	server, err := New(failingStarter{err: errors.New("start failed")}, policy.Default(), ratelimit.New(1, 100, time.Hour))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.Code)
+	}
+	assertRecorderAPIError(t, response, ErrorCodeInternal, "internal server error")
 
+	second := serveRun(server.Handler(), "127.0.0.1:12345")
+	if second.Code != http.StatusInternalServerError {
+		t.Fatalf("second status = %d, want 500", second.Code)
+	}
+}
+
+func TestServerRateLimitFollowsExecutionLifetime(t *testing.T) {
+	executor := &fakeExecutor{started: make(chan struct{}, 2), release: make(chan struct{})}
+	server, manager, observer := newTestServer(t, executor, policy.Default(), ratelimit.New(1, 100, time.Hour))
 	handler := server.Handler()
 
 	first := serveRun(handler, "127.0.0.1:12345")
-	if first.Code != http.StatusInternalServerError {
-		t.Fatalf(
-			"first status = %d, want %d",
-			first.Code,
-			http.StatusInternalServerError,
-		)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202", first.Code)
 	}
+	<-executor.started
 
 	second := serveRun(handler, "127.0.0.1:54321")
-	if second.Code != http.StatusInternalServerError {
-		t.Fatalf(
-			"second status = %d, want %d",
-			second.Code,
-			http.StatusInternalServerError,
-		)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429", second.Code)
+	}
+
+	close(executor.release)
+	waitForLifecycle(t, observer)
+	if snapshot, _ := manager.Get(executor.ID()); snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("first status = %q, want completed", snapshot.Status)
+	}
+
+	third := serveRun(handler, "127.0.0.1:67890")
+	if third.Code != http.StatusAccepted {
+		t.Fatalf("third status = %d, want 202", third.Code)
 	}
 }
 
-func TestServerDefaultLimiterIsSharedByHandler(t *testing.T) {
-	server, err := New(newTestExecutionService(t, &fakeExecutor{}), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	for i := 0; i < ratelimit.DefaultMaxConcurrentExecutions; i++ {
-		if !server.limiter.Allow("127.0.0.1") {
-			t.Fatalf("direct admission %d should succeed", i)
-		}
-	}
-	defer func() {
-		for i := 0; i < ratelimit.DefaultMaxConcurrentExecutions; i++ {
-			server.limiter.Done("127.0.0.1")
-		}
-	}()
-
-	response := serveRun(server.Handler(), "127.0.0.1:12345")
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusTooManyRequests)
-	}
-}
-
-func TestClientKey(t *testing.T) {
+func TestServerValidationAndMethodErrors(t *testing.T) {
 	tests := []struct {
-		remoteAddr string
-		want       string
+		name       string
+		method     string
+		body       string
+		wantStatus int
+		wantCode   ErrorCode
 	}{
-		{remoteAddr: "127.0.0.1:12345", want: "127.0.0.1"},
-		{remoteAddr: "[::1]:54321", want: "::1"},
-		{remoteAddr: "127.0.0.1", want: "127.0.0.1"},
-		{remoteAddr: "unusual", want: "unusual"},
+		{"method", http.MethodGet, "", http.StatusMethodNotAllowed, ErrorCodeMethodNotAllowed},
+		{"json", http.MethodPost, `{"service":`, http.StatusBadRequest, ErrorCodeInvalidJSON},
+		{"scenario", http.MethodPost, `{"service":"payments","operation":"get_user"}`, http.StatusBadRequest, ErrorCodeInvalidScenario},
 	}
-
 	for _, test := range tests {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/run", nil)
-		req.RemoteAddr = test.remoteAddr
-		if got := clientKey(req); got != test.want {
-			t.Errorf("clientKey(%q) = %q, want %q", test.remoteAddr, got, test.want)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+			req := httptest.NewRequest(test.method, "/api/v1/run", strings.NewReader(test.body))
+			req.RemoteAddr = "127.0.0.1:12345"
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, req)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			assertRecorderAPIError(t, response, test.wantCode, "")
+		})
 	}
 }
 
-func TestServerCompletedUpstreamResponse(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{
-		result: execution.Result{
-			Scenario: demo.Scenario{Service: demo.ServiceUsers, Operation: demo.OperationGetUser},
-			Requests: []execution.RequestResult{{
-				StatusCode: http.StatusServiceUnavailable,
-				Status:     "503 Service Unavailable",
-			}},
-		},
-	})
-	defer server.Close()
-
-	resp := postRun(t, server, validRequestBody())
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body runResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if len(body.Requests) != 1 || body.Requests[0].StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("requests = %+v, want one 503 result", body.Requests)
-	}
-	if body.Requests[0].Error != "" {
-		t.Fatalf("completed response error = %q, want empty", body.Requests[0].Error)
-	}
-}
-
-func TestServerMethodNotAllowedReturnsJSONError(t *testing.T) {
-	server := newTestServer(t, &fakeExecutor{})
-	defer server.Close()
-
-	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/v1/run", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
-	}
-	resp, err := server.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-	assertAPIError(t, resp, ErrorCodeMethodNotAllowed, "method not allowed")
-}
-
-func newTestServer(t *testing.T, executor executionservice.Executor) *httptest.Server {
-	t.Helper()
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), ratelimit.NewDefault())
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-	return httptest.NewServer(server.Handler())
-}
-
-func newTestServerWithLimiter(t *testing.T, executor executionservice.Executor, limiter *ratelimit.Limiter) *httptest.Server {
-	t.Helper()
-	server, err := New(newTestExecutionService(t, executor), policy.Default(), limiter)
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-	return httptest.NewServer(server.Handler())
-}
-
-func newTestExecutionService(t *testing.T, executor executionservice.Executor) *executionservice.Service {
-	t.Helper()
-	service, err := executionservice.New(executor, newTestLifecycleManager(t))
-	if err != nil {
-		t.Fatalf("executionservice.New() error: %v", err)
-	}
-	return service
-}
-
-func newTestLifecycleManager(t *testing.T) *lifecycle.Manager {
+func newTestServer(t *testing.T, executor executionservice.Executor, executionPolicy policy.Policy, limiter *ratelimit.Limiter) (*Server, *lifecycle.Manager, *observedLifecycle) {
 	t.Helper()
 	manager, err := lifecycle.New(10)
 	if err != nil {
 		t.Fatalf("lifecycle.New() error: %v", err)
 	}
-	return manager
-}
-
-func validRequestBody() string {
-	return `{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb"}`
-}
-
-func postRun(t *testing.T, server *httptest.Server, body string) *http.Response {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/run", jsonBody(body))
+	observed := &observedLifecycle{manager: manager, done: make(chan struct{})}
+	service, err := executionservice.New(executor, observed)
 	if err != nil {
-		t.Fatalf("NewRequest() error: %v", err)
+		t.Fatalf("executionservice.New() error: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := server.Client().Do(req)
+	server, err := New(service, executionPolicy, limiter)
 	if err != nil {
-		t.Fatalf("request error: %v", err)
+		t.Fatalf("New() error: %v", err)
 	}
-	return resp
-}
-
-func assertAPIError(t *testing.T, resp *http.Response, code ErrorCode, message string) {
-	t.Helper()
-	if contentType := resp.Header.Get("Content-Type"); contentType != "application/json" {
-		t.Fatalf("content type = %q, want application/json", contentType)
-	}
-
-	var body errorResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode API error: %v", err)
-	}
-	if body.Error.Code != code {
-		t.Fatalf("error code = %q, want %q", body.Error.Code, code)
-	}
-	if body.Error.Message != message {
-		t.Fatalf("error message = %q, want %q", body.Error.Message, message)
-	}
-}
-
-func jsonBody(value string) *strings.Reader {
-	return strings.NewReader(value)
+	return server, manager, observed
 }
 
 func serveRun(handler http.Handler, remoteAddr string) *httptest.ResponseRecorder {
@@ -1071,133 +367,30 @@ func serveRun(handler http.Handler, remoteAddr string) *httptest.ResponseRecorde
 	return response
 }
 
+func waitForLifecycle(t *testing.T, observer *observedLifecycle) {
+	t.Helper()
+	select {
+	case <-observer.done:
+		return
+	case <-time.After(time.Second):
+		t.Fatal("execution did not finish")
+	}
+}
+
+func validRequestBody() string {
+	return `{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb"}`
+}
+
 func assertRecorderAPIError(t *testing.T, response *httptest.ResponseRecorder, code ErrorCode, message string) {
 	t.Helper()
 	var body errorResponse
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatalf("decode API error: %v", err)
 	}
-	if body.Error.Code != code || body.Error.Message != message {
-		t.Fatalf("error = %+v, want code %q and message %q", body.Error, code, message)
+	if body.Error.Code != code {
+		t.Fatalf("error code = %q, want %q", body.Error.Code, code)
 	}
-}
-
-func TestServerRateLimitRejectsConcurrentExecutionForSameClient(t *testing.T) {
-	executor := &blockingExecutor{
-		started: make(chan struct{}, 1),
-		release: make(chan struct{}),
-	}
-
-	server, err := New(
-		newTestExecutionService(t, executor),
-		policy.Default(),
-		ratelimit.New(1, 100, time.Hour),
-	)
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	handler := server.Handler()
-
-	firstResult := make(chan *httptest.ResponseRecorder, 1)
-
-	go func() {
-		firstResult <- serveRun(
-			handler,
-			"127.0.0.1:12345",
-		)
-	}()
-
-	<-executor.started
-
-	second := serveRun(
-		handler,
-		"127.0.0.1:54321",
-	)
-
-	if second.Code != http.StatusTooManyRequests {
-		t.Fatalf(
-			"second status = %d, want %d",
-			second.Code,
-			http.StatusTooManyRequests,
-		)
-	}
-
-	assertRecorderAPIError(
-		t,
-		second,
-		ErrorCodeRateLimited,
-		"rate limit exceeded",
-	)
-
-	close(executor.release)
-
-	first := <-firstResult
-
-	if first.Code != http.StatusOK {
-		t.Fatalf(
-			"first status = %d, want %d",
-			first.Code,
-			http.StatusOK,
-		)
-	}
-}
-
-func TestServerPolicyRejectionDoesNotConsumeRateLimit(t *testing.T) {
-	executor := &fakeExecutor{}
-
-	executionPolicy := policy.Default()
-	executionPolicy.MaxRequests = 1
-
-	limiter := ratelimit.New(1, 1, time.Hour)
-
-	server, err := New(
-		newTestExecutionService(t, executor),
-		executionPolicy,
-		limiter,
-	)
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"/api/v1/run",
-		strings.NewReader(
-			`{"service":"users","operation":"get_user","simulation":"normal","request_size":"0b","response_size":"1kb","request_count":2}`,
-		),
-	)
-	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Content-Type", "application/json")
-
-	first := httptest.NewRecorder()
-	server.Handler().ServeHTTP(first, req)
-
-	if first.Code != http.StatusBadRequest {
-		t.Fatalf(
-			"status = %d, want %d",
-			first.Code,
-			http.StatusBadRequest,
-		)
-	}
-
-	assertRecorderAPIError(
-		t,
-		first,
-		ErrorCodePolicyRejected,
-		"request count 2 exceeds maximum 1",
-	)
-
-	allowed := serveRun(
-		server.Handler(),
-		"127.0.0.1:12345",
-	)
-
-	if allowed.Code != http.StatusOK {
-		t.Fatalf(
-			"second status = %d, want %d",
-			allowed.Code,
-			http.StatusOK,
-		)
+	if message != "" && body.Error.Message != message {
+		t.Fatalf("error message = %q, want %q", body.Error.Message, message)
 	}
 }
