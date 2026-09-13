@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/event"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 )
@@ -715,6 +716,303 @@ func TestStartRunsConcurrentExecutionsIndependently(t *testing.T) {
 			t.Fatalf("execution %d status = %q, want completed", i, snapshot.Status)
 		}
 	}
+}
+
+func TestExecutePublishesLifecycleEvents(t *testing.T) {
+	executorErr := errors.New("executor failed")
+
+	tests := []struct {
+		name     string
+		executor *fakeExecutor
+		want     []event.EventType
+		wantErr  error
+	}{
+		{
+			name: "success",
+			executor: &fakeExecutor{
+				result: execution.Result{ExecutionID: "exec_1"},
+			},
+			want: []event.EventType{
+				event.EventCreated,
+				event.EventStarted,
+				event.EventCompleted,
+			},
+		},
+		{
+			name: "executor failure",
+			executor: &fakeExecutor{
+				err: executorErr,
+			},
+			want: []event.EventType{
+				event.EventCreated,
+				event.EventStarted,
+				event.EventFailed,
+			},
+			wantErr: executorErr,
+		},
+		{
+			name: "caller cancellation",
+			executor: &fakeExecutor{
+				block:   true,
+				started: make(chan struct{}, 1),
+				release: make(chan struct{}),
+			},
+			want: []event.EventType{
+				event.EventCreated,
+				event.EventStarted,
+				event.EventCancelled,
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "policy timeout",
+			executor: &fakeExecutor{
+				block:   true,
+				started: make(chan struct{}, 1),
+				release: make(chan struct{}),
+			},
+			want: []event.EventType{
+				event.EventCreated,
+				event.EventStarted,
+				event.EventFailed,
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := testManager(t)
+			publisher := event.NewRecordingPublisher()
+
+			service, err := New(
+				tc.executor,
+				manager,
+				publisher,
+			)
+			if err != nil {
+				t.Fatalf("New() error: %v", err)
+			}
+
+			var ctx context.Context
+			var cancel context.CancelFunc
+
+			switch tc.name {
+			case "caller cancellation":
+				ctx, cancel = context.WithCancel(context.Background())
+
+				go func() {
+					select {
+					case <-tc.executor.started:
+						cancel()
+					case <-time.After(time.Second):
+					}
+				}()
+
+			case "policy timeout":
+				ctx, cancel = context.WithTimeout(
+					context.Background(),
+					time.Millisecond,
+				)
+
+			default:
+				ctx = context.Background()
+			}
+
+			if cancel != nil {
+				defer cancel()
+			}
+
+			_, err = service.Execute(
+				ctx,
+				"exec_1",
+				testScenario(),
+			)
+
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf(
+						"Execute() error = %v, want %v",
+						err,
+						tc.wantErr,
+					)
+				}
+			} else if err != nil {
+				t.Fatalf("Execute() error: %v", err)
+			}
+
+			events := publisher.Events()
+
+			if len(events) != len(tc.want) {
+				t.Fatalf(
+					"len(events) = %d, want %d: %+v",
+					len(events),
+					len(tc.want),
+					events,
+				)
+			}
+
+			for i, wantType := range tc.want {
+				if events[i].Type != wantType {
+					t.Fatalf(
+						"event[%d].Type = %q, want %q",
+						i,
+						events[i].Type,
+						wantType,
+					)
+				}
+
+				if events[i].ExecutionID != "exec_1" {
+					t.Fatalf(
+						"event[%d].ExecutionID = %q, want exec_1",
+						i,
+						events[i].ExecutionID,
+					)
+				}
+
+				if events[i].Sequence != uint64(i+1) {
+					t.Fatalf(
+						"event[%d].Sequence = %d, want %d",
+						i,
+						events[i].Sequence,
+						i+1,
+					)
+				}
+
+				if events[i].Timestamp.IsZero() {
+					t.Fatal("event timestamp must be non-zero")
+				}
+			}
+		})
+	}
+}
+
+func TestStartPublishesLifecycleEvents(t *testing.T) {
+	cases := []struct {
+		name     string
+		executor *fakeExecutor
+		want     []event.EventType
+		start    func(*Service, string, demo.Scenario) error
+		after    func(*testing.T, *Service, *event.RecordingPublisher)
+	}{
+		{
+			name:     "success",
+			executor: &fakeExecutor{block: true, started: make(chan struct{}, 1), release: make(chan struct{}), result: execution.Result{ExecutionID: "exec_1"}},
+			want:     []event.EventType{event.EventCreated, event.EventStarted, event.EventCompleted},
+			start: func(s *Service, id string, scenario demo.Scenario) error {
+				return s.Start(id, scenario, time.Second)
+			},
+			after: func(t *testing.T, s *Service, p *event.RecordingPublisher) {
+				t.Helper()
+				<-s.executor.(*fakeExecutor).started
+				close(s.executor.(*fakeExecutor).release)
+			},
+		},
+		{
+			name:     "failure",
+			executor: &fakeExecutor{err: errors.New("executor failed")},
+			want:     []event.EventType{event.EventCreated, event.EventStarted, event.EventFailed},
+			start: func(s *Service, id string, scenario demo.Scenario) error {
+				return s.Start(id, scenario, time.Second)
+			},
+			after: func(t *testing.T, s *Service, p *event.RecordingPublisher) {},
+		},
+		{
+			name:     "cancellation",
+			executor: &fakeExecutor{block: true, started: make(chan struct{}, 1), release: make(chan struct{})},
+			want:     []event.EventType{event.EventCreated, event.EventStarted, event.EventCancelled},
+			start: func(s *Service, id string, scenario demo.Scenario) error {
+				return s.Start(id, scenario, time.Second)
+			},
+			after: func(t *testing.T, s *Service, p *event.RecordingPublisher) {
+				t.Helper()
+				<-s.executor.(*fakeExecutor).started
+				if err := s.Cancel("exec_1"); err != nil {
+					t.Fatalf("Cancel() error: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := testManager(t)
+			publisher := event.NewRecordingPublisher()
+			service, err := New(tc.executor, manager, publisher)
+			if err != nil {
+				t.Fatalf("New() error: %v", err)
+			}
+			if err := tc.start(service, "exec_1", testScenario()); err != nil {
+				t.Fatalf("Start() error: %v", err)
+			}
+			tc.after(t, service, publisher)
+
+			var events []event.Event
+			deadline := time.After(time.Second)
+			for {
+				select {
+				case <-deadline:
+					t.Fatal("timed out waiting for lifecycle events")
+				default:
+					events = publisher.Events()
+					if len(events) == len(tc.want) {
+						break
+					}
+				}
+				if len(events) == len(tc.want) {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			for i, wantType := range tc.want {
+				if events[i].Type != wantType {
+					t.Fatalf("event[%d].Type = %q, want %q", i, events[i].Type, wantType)
+				}
+				if events[i].ExecutionID != "exec_1" {
+					t.Fatalf("event[%d].ExecutionID = %q, want exec_1", i, events[i].ExecutionID)
+				}
+				if events[i].Sequence != uint64(i+1) {
+					t.Fatalf("event[%d].Sequence = %d, want %d", i, events[i].Sequence, i+1)
+				}
+				if events[i].Timestamp.IsZero() {
+					t.Fatal("event timestamp must be non-zero")
+				}
+			}
+		})
+	}
+}
+
+func TestPublisherFailureDoesNotCorruptExecution(t *testing.T) {
+	manager := testManager(t)
+	executor := &fakeExecutor{result: execution.Result{ExecutionID: "exec_1"}}
+	publisher := event.FailingPublisher{Err: errors.New("publish failed")}
+	service, err := New(executor, manager, publisher)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	_, err = service.Execute(context.Background(), "exec_1", testScenario())
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	snapshot, ok := manager.Get("exec_1")
+	if !ok {
+		t.Fatal("execution not found")
+	}
+	if snapshot.Status != lifecycle.StatusCompleted {
+		t.Fatalf("status = %q, want completed", snapshot.Status)
+	}
+}
+
+func executorStarted(executor *fakeExecutor) <-chan struct{} {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.started == nil {
+		return nil
+	}
+	return executor.started
 }
 
 func contains(value, fragment string) bool {

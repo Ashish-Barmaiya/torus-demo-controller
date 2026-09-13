@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/event"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 )
@@ -85,11 +86,15 @@ type Service struct {
 	executor         Executor
 	lifecycleManager LifecycleManager
 	activeExecutions *activeExecutions
+	eventPublisher   event.Publisher
+	sequenceMu       sync.Mutex
+	sequences        map[string]uint64
 }
 
 func New(
 	executor Executor,
 	lifecycleManager LifecycleManager,
+	publishers ...event.Publisher,
 ) (*Service, error) {
 	if executor == nil {
 		return nil, fmt.Errorf("executor must not be nil")
@@ -98,10 +103,17 @@ func New(
 		return nil, fmt.Errorf("lifecycle manager must not be nil")
 	}
 
+	var publisher event.Publisher = event.NoopPublisher{}
+	if len(publishers) > 0 && publishers[0] != nil {
+		publisher = publishers[0]
+	}
+
 	return &Service{
 		executor:         executor,
 		lifecycleManager: lifecycleManager,
 		activeExecutions: newActiveExecutions(),
+		eventPublisher:   publisher,
+		sequences:        make(map[string]uint64),
 	}, nil
 }
 
@@ -113,10 +125,12 @@ func (s *Service) Execute(
 	if _, err := s.lifecycleManager.Create(executionID, scenario); err != nil {
 		return execution.Result{}, fmt.Errorf("create execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventCreated)
 
 	if err := s.lifecycleManager.Start(executionID); err != nil {
 		return execution.Result{}, fmt.Errorf("start execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventStarted)
 
 	return s.executeAndRecord(ctx, executionID, scenario)
 }
@@ -175,10 +189,12 @@ func (s *Service) start(
 	if _, err := s.lifecycleManager.Create(executionID, scenario); err != nil {
 		return fmt.Errorf("create execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventCreated)
 
 	if err := s.lifecycleManager.Start(executionID); err != nil {
 		return fmt.Errorf("start execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventStarted)
 
 	executionCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	s.activeExecutions.register(executionID, cancel)
@@ -217,6 +233,7 @@ func (s *Service) executeAndRecord(
 		if lifecycleErr := s.lifecycleManager.Fail(executionID, ctx.Err()); lifecycleErr != nil {
 			return result, fmt.Errorf("fail execution: %w", lifecycleErr)
 		}
+		s.publishLifecycleEvent(executionID, event.EventFailed)
 		return result, ctx.Err()
 	}
 
@@ -224,12 +241,14 @@ func (s *Service) executeAndRecord(
 		if lifecycleErr := s.lifecycleManager.Cancel(executionID); lifecycleErr != nil {
 			return result, fmt.Errorf("cancel execution: %w", lifecycleErr)
 		}
+		s.publishLifecycleEvent(executionID, event.EventCancelled)
 		return result, nil
 	}
 
 	if err := s.lifecycleManager.Complete(executionID, result); err != nil {
 		return result, fmt.Errorf("complete execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventCompleted)
 
 	return result, nil
 }
@@ -243,6 +262,7 @@ func (s *Service) finishError(
 		if err := s.lifecycleManager.Fail(executionID, ctx.Err()); err != nil {
 			return fmt.Errorf("fail execution: %w", err)
 		}
+		s.publishLifecycleEvent(executionID, event.EventFailed)
 		return executionErr
 	}
 
@@ -250,12 +270,44 @@ func (s *Service) finishError(
 		if err := s.lifecycleManager.Cancel(executionID); err != nil {
 			return fmt.Errorf("cancel execution: %w", err)
 		}
+		s.publishLifecycleEvent(executionID, event.EventCancelled)
 		return executionErr
 	}
 
 	if err := s.lifecycleManager.Fail(executionID, executionErr); err != nil {
 		return fmt.Errorf("fail execution: %w", err)
 	}
+	s.publishLifecycleEvent(executionID, event.EventFailed)
 
 	return executionErr
+}
+
+func (s *Service) publishLifecycleEvent(
+	executionID string,
+	eventType event.EventType,
+) {
+	if s.eventPublisher == nil {
+		return
+	}
+
+	s.sequenceMu.Lock()
+	sequence := s.sequences[executionID] + 1
+	s.sequences[executionID] = sequence
+	s.sequenceMu.Unlock()
+
+	evt := event.Event{
+		Sequence:    sequence,
+		ExecutionID: executionID,
+		Type:        eventType,
+		Timestamp:   time.Now().UTC(),
+	}
+
+	_ = s.eventPublisher.Publish(evt)
+
+	switch eventType {
+	case event.EventCompleted, event.EventFailed, event.EventCancelled:
+		s.sequenceMu.Lock()
+		delete(s.sequences, executionID)
+		s.sequenceMu.Unlock()
+	}
 }

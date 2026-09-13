@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/config"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/event"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/executionservice"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
@@ -62,7 +63,13 @@ func main() {
 		log.Fatalf("create lifecycle manager: %v", err)
 	}
 
-	executionService, err := executionservice.New(executor, lifecycleManager)
+	eventPublisher := event.NoopPublisher{}
+
+	executionService, err := executionservice.New(
+		executor,
+		lifecycleManager,
+		eventPublisher,
+	)
 	if err != nil {
 		log.Fatalf("create execution service: %v", err)
 	}
