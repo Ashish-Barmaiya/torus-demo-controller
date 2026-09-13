@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/executionservice"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/policy"
@@ -19,15 +21,16 @@ import (
 type ErrorCode string
 
 const (
-	ErrorCodeInvalidJSON       ErrorCode = "INVALID_JSON"
-	ErrorCodeInvalidScenario   ErrorCode = "INVALID_SCENARIO"
-	ErrorCodePolicyRejected    ErrorCode = "POLICY_REJECTED"
-	ErrorCodeRateLimited       ErrorCode = "RATE_LIMITED"
-	ErrorCodeExecutionTimeout  ErrorCode = "EXECUTION_TIMEOUT"
-	ErrorCodeUpstreamError     ErrorCode = "UPSTREAM_ERROR"
-	ErrorCodeInternal          ErrorCode = "INTERNAL_ERROR"
-	ErrorCodeMethodNotAllowed  ErrorCode = "METHOD_NOT_ALLOWED"
-	ErrorCodeExecutionNotFound ErrorCode = "EXECUTION_NOT_FOUND"
+	ErrorCodeInvalidJSON        ErrorCode = "INVALID_JSON"
+	ErrorCodeInvalidScenario    ErrorCode = "INVALID_SCENARIO"
+	ErrorCodePolicyRejected     ErrorCode = "POLICY_REJECTED"
+	ErrorCodeRateLimited        ErrorCode = "RATE_LIMITED"
+	ErrorCodeExecutionTimeout   ErrorCode = "EXECUTION_TIMEOUT"
+	ErrorCodeUpstreamError      ErrorCode = "UPSTREAM_ERROR"
+	ErrorCodeInternal           ErrorCode = "INTERNAL_ERROR"
+	ErrorCodeMethodNotAllowed   ErrorCode = "METHOD_NOT_ALLOWED"
+	ErrorCodeExecutionNotFound  ErrorCode = "EXECUTION_NOT_FOUND"
+	ErrorCodeExecutionNotActive ErrorCode = "EXECUTION_NOT_ACTIVE"
 )
 
 type APIError struct {
@@ -62,6 +65,7 @@ type ExecutionStarter interface {
 		time.Duration,
 		func(),
 	) error
+	Cancel(string) error
 }
 
 func New(
@@ -93,8 +97,8 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/run", s.handleRun)
-	mux.HandleFunc("/api/v1/executions/", s.handleExecutionStatus)
-	mux.HandleFunc("/api/v1/executions", s.handleExecutionStatus)
+	mux.HandleFunc("/api/v1/executions/", s.handleExecution)
+	mux.HandleFunc("/api/v1/executions", s.handleExecution)
 
 	return mux
 }
@@ -117,6 +121,10 @@ type startResponse struct {
 	ExecutionID string `json:"execution_id"`
 }
 
+type cancelResponse struct {
+	ExecutionID string `json:"execution_id"`
+}
+
 type executionResponse struct {
 	ExecutionID string            `json:"execution_id"`
 	Scenario    demo.Scenario     `json:"scenario"`
@@ -128,24 +136,37 @@ type executionResponse struct {
 	Error       string            `json:"error"`
 }
 
-func (s *Server) handleExecutionStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAPIError(w, http.StatusMethodNotAllowed, APIError{
-			Code:    ErrorCodeMethodNotAllowed,
-			Message: "method not allowed",
-		})
+func (s *Server) handleExecution(w http.ResponseWriter, r *http.Request) {
+	if id, ok := s.parseExecutionStatusID(r); ok {
+		if r.Method != http.MethodGet {
+			writeAPIError(w, http.StatusMethodNotAllowed, APIError{
+				Code:    ErrorCodeMethodNotAllowed,
+				Message: "method not allowed",
+			})
+			return
+		}
+		s.handleExecutionStatusForID(w, id)
+		return
+	}
+	if id, ok := s.parseCancelExecutionID(r); ok {
+		if r.Method != http.MethodPost {
+			writeAPIError(w, http.StatusMethodNotAllowed, APIError{
+				Code:    ErrorCodeMethodNotAllowed,
+				Message: "method not allowed",
+			})
+			return
+		}
+		s.handleCancelExecutionForID(w, id)
 		return
 	}
 
-	executionID, ok := s.parseExecutionID(r)
-	if !ok {
-		writeAPIError(w, http.StatusNotFound, APIError{
-			Code:    ErrorCodeExecutionNotFound,
-			Message: "execution not found",
-		})
-		return
-	}
+	writeAPIError(w, http.StatusNotFound, APIError{
+		Code:    ErrorCodeExecutionNotFound,
+		Message: "execution not found",
+	})
+}
 
+func (s *Server) handleExecutionStatusForID(w http.ResponseWriter, executionID string) {
 	snapshot, found := s.manager.Get(executionID)
 	if !found {
 		writeAPIError(w, http.StatusNotFound, APIError{
@@ -176,7 +197,30 @@ func (s *Server) handleExecutionStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) parseExecutionID(r *http.Request) (string, bool) {
+func (s *Server) handleCancelExecutionForID(w http.ResponseWriter, executionID string) {
+	err := s.executionService.Cancel(executionID)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusAccepted, cancelResponse{ExecutionID: executionID})
+	case errors.Is(err, executionservice.ErrExecutionNotFound):
+		writeAPIError(w, http.StatusNotFound, APIError{
+			Code:    ErrorCodeExecutionNotFound,
+			Message: "execution not found",
+		})
+	case errors.Is(err, executionservice.ErrExecutionNotActive):
+		writeAPIError(w, http.StatusConflict, APIError{
+			Code:    ErrorCodeExecutionNotActive,
+			Message: "execution not active",
+		})
+	default:
+		writeAPIError(w, http.StatusInternalServerError, APIError{
+			Code:    ErrorCodeInternal,
+			Message: "internal server error",
+		})
+	}
+}
+
+func (s *Server) parseExecutionStatusID(r *http.Request) (string, bool) {
 	if r == nil {
 		return "", false
 	}
@@ -187,7 +231,6 @@ func (s *Server) parseExecutionID(r *http.Request) (string, bool) {
 	if path == prefix || path == prefix+"/" {
 		return "", false
 	}
-
 	if !strings.HasPrefix(path, prefix) {
 		return "", false
 	}
@@ -202,6 +245,34 @@ func (s *Server) parseExecutionID(r *http.Request) (string, bool) {
 
 	segments := strings.Split(strings.Trim(remainder, "/"), "/")
 	if len(segments) != 1 || segments[0] == "" {
+		return "", false
+	}
+
+	return segments[0], true
+}
+
+func (s *Server) parseCancelExecutionID(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+
+	path := r.URL.Path
+	prefix := "/api/v1/executions"
+
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+
+	remainder := strings.TrimPrefix(path, prefix)
+	if remainder == "" || remainder == "/" {
+		return "", false
+	}
+	if !strings.HasPrefix(remainder, "/") {
+		return "", false
+	}
+
+	segments := strings.Split(strings.Trim(remainder, "/"), "/")
+	if len(segments) != 2 || segments[0] == "" || segments[1] != "cancel" {
 		return "", false
 	}
 
@@ -314,6 +385,8 @@ func apiErrorStatus(apiErr APIError) int {
 		return http.StatusMethodNotAllowed
 	case ErrorCodeExecutionNotFound:
 		return http.StatusNotFound
+	case ErrorCodeExecutionNotActive:
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}

@@ -84,6 +84,10 @@ func (o *observedLifecycle) Create(id string, scenario demo.Scenario) (*lifecycl
 	return o.manager.Create(id, scenario)
 }
 
+func (o *observedLifecycle) Get(id string) (*lifecycle.ExecutionSnapshot, bool) {
+	return o.manager.Get(id)
+}
+
 func (o *observedLifecycle) Start(id string) error {
 	return o.manager.Start(id)
 }
@@ -116,6 +120,10 @@ type failingStarter struct {
 
 func (s failingStarter) StartWithCompletion(string, demo.Scenario, time.Duration, func()) error {
 	return s.err
+}
+
+func (s failingStarter) Cancel(string) error {
+	return nil
 }
 
 func TestServerExecutionStatusEndpoint(t *testing.T) {
@@ -447,6 +455,94 @@ func TestServerCompletedEmbeddedFailuresReturnAccepted(t *testing.T) {
 	}
 }
 
+func TestServerCancelExecution(t *testing.T) {
+	executor := &fakeExecutor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	server, manager, observer := newTestServer(
+		t,
+		executor,
+		policy.Default(),
+		ratelimit.NewDefault(),
+	)
+
+	response := serveRun(server.Handler(), "127.0.0.1:12345")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", response.Code)
+	}
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+
+	cancelResponse := serveCancelExecution(
+		server.Handler(),
+		executor.ID(),
+	)
+	if cancelResponse.Code != http.StatusAccepted {
+		t.Fatalf("cancel status = %d, want 202", cancelResponse.Code)
+	}
+
+	var payload struct {
+		ExecutionID string `json:"execution_id"`
+	}
+
+	if err := json.NewDecoder(cancelResponse.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
+
+	if payload.ExecutionID != executor.ID() {
+		t.Fatalf(
+			"execution_id = %q, want %q",
+			payload.ExecutionID,
+			executor.ID(),
+		)
+	}
+
+	select {
+	case <-observer.done:
+	case <-time.After(time.Second):
+		t.Fatal("execution did not reach cancelled state")
+	}
+
+	snapshot, ok := manager.Get(executor.ID())
+	if !ok {
+		t.Fatal("execution not found")
+	}
+
+	if snapshot.Status != lifecycle.StatusCancelled {
+		t.Fatalf(
+			"status = %q, want %q",
+			snapshot.Status,
+			lifecycle.StatusCancelled,
+		)
+	}
+}
+
+func TestServerCancelErrors(t *testing.T) {
+	server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+
+	resp := serveCancelExecution(server.Handler(), "missing-exec")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+	assertRecorderAPIError(t, resp, ErrorCodeExecutionNotFound, "execution not found")
+
+	resp = serveCancelMethod(server.Handler(), http.MethodGet, "exec_1")
+	if resp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
+	}
+	assertRecorderAPIError(t, resp, ErrorCodeMethodNotAllowed, "method not allowed")
+
+	resp = serveCustomCancel(server.Handler(), "/api/v1/executions/exec_1/cancel/extra")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
 func TestServerStartFailureReturnsInternalError(t *testing.T) {
 	manager, err := lifecycle.New(10)
 	if err != nil {
@@ -566,6 +662,27 @@ func serveExecutionMethod(handler http.Handler, method, executionID string) *htt
 
 func serveCustomGet(handler http.Handler, path string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodGet, path, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func serveCancelExecution(handler http.Handler, executionID string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/executions/"+executionID+"/cancel", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func serveCancelMethod(handler http.Handler, method, executionID string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "/api/v1/executions/"+executionID+"/cancel", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func serveCustomCancel(handler http.Handler, path string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, path, nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

@@ -75,6 +75,10 @@ func (m *asyncLifecycle) Create(id string, scenario demo.Scenario) (*lifecycle.E
 	return m.manager.Create(id, scenario)
 }
 
+func (m *asyncLifecycle) Get(id string) (*lifecycle.ExecutionSnapshot, bool) {
+	return m.manager.Get(id)
+}
+
 func (m *asyncLifecycle) Start(id string) error {
 	return m.manager.Start(id)
 }
@@ -109,6 +113,13 @@ func (m *recordingLifecycle) Create(id string, scenario demo.Scenario) (*lifecyc
 		return nil, m.createErr
 	}
 	return &lifecycle.Execution{ID: id, Scenario: scenario}, nil
+}
+
+func (m *recordingLifecycle) Get(id string) (*lifecycle.ExecutionSnapshot, bool) {
+	if id == m.createdID && m.startedID == id {
+		return &lifecycle.ExecutionSnapshot{ID: id, Status: lifecycle.StatusRunning}, true
+	}
+	return nil, false
 }
 
 func (m *recordingLifecycle) Start(id string) error {
@@ -420,6 +431,115 @@ func TestStartRejectsInvalidTimeout(t *testing.T) {
 		if err := service.Start("exec_1", testScenario(), timeout); err == nil {
 			t.Fatalf("Start() with timeout %v should fail", timeout)
 		}
+	}
+}
+
+func TestCancelRunningExecution(t *testing.T) {
+	manager := testManager(t)
+	lifecycleRecorder := &asyncLifecycle{
+		manager: manager,
+		done:    make(chan struct{}, 1),
+	}
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	service, err := New(executor, lifecycleRecorder)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	if err := service.Start(
+		"exec_1",
+		testScenario(),
+		time.Second,
+	); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+
+	if err := service.Cancel("exec_1"); err != nil {
+		t.Fatalf("Cancel() error: %v", err)
+	}
+
+	select {
+	case <-lifecycleRecorder.done:
+	case <-time.After(time.Second):
+		t.Fatal("execution did not reach terminal state")
+	}
+
+	snapshot, ok := manager.Get("exec_1")
+	if !ok {
+		t.Fatal("execution not found")
+	}
+
+	if snapshot.Status != lifecycle.StatusCancelled {
+		t.Fatalf(
+			"status = %q, want %q",
+			snapshot.Status,
+			lifecycle.StatusCancelled,
+		)
+	}
+}
+
+func TestCancelReturnsNotFoundOrNotActive(t *testing.T) {
+	manager := testManager(t)
+
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+
+	service, err := New(executor, manager)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	if err := service.Cancel("missing"); !errors.Is(
+		err,
+		ErrExecutionNotFound,
+	) {
+		t.Fatalf(
+			"Cancel() error = %v, want %v",
+			err,
+			ErrExecutionNotFound,
+		)
+	}
+
+	if err := service.Start(
+		"exec_1",
+		testScenario(),
+		time.Second,
+	); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+
+	if err := service.Cancel("exec_1"); err != nil {
+		t.Fatalf("first Cancel() error: %v", err)
+	}
+
+	if err := service.Cancel("exec_1"); !errors.Is(
+		err,
+		ErrExecutionNotActive,
+	) {
+		t.Fatalf(
+			"second Cancel() error = %v, want %v",
+			err,
+			ErrExecutionNotActive,
+		)
 	}
 }
 

@@ -2,12 +2,19 @@ package executionservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/lifecycle"
+)
+
+var (
+	ErrExecutionNotFound  = errors.New("execution not found")
+	ErrExecutionNotActive = errors.New("execution not active")
 )
 
 type LifecycleManager interface {
@@ -16,6 +23,7 @@ type LifecycleManager interface {
 	Complete(string, execution.Result) error
 	Fail(string, error) error
 	Cancel(string) error
+	Get(string) (*lifecycle.ExecutionSnapshot, bool)
 }
 
 type Executor interface {
@@ -26,9 +34,57 @@ type Executor interface {
 	) (execution.Result, error)
 }
 
+type activeExecutions struct {
+	mu      sync.Mutex
+	entries map[string]context.CancelFunc
+}
+
+func newActiveExecutions() *activeExecutions {
+	return &activeExecutions{entries: make(map[string]context.CancelFunc)}
+}
+
+func (a *activeExecutions) register(id string, cancel context.CancelFunc) {
+	if cancel == nil {
+		return
+	}
+	if id == "" {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries[id] = cancel
+}
+
+func (a *activeExecutions) remove(id string) {
+	if id == "" {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.entries, id)
+}
+
+func (a *activeExecutions) cancel(id string) (context.CancelFunc, bool) {
+	if id == "" {
+		return nil, false
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cancel, ok := a.entries[id]
+	if !ok {
+		return nil, false
+	}
+	delete(a.entries, id)
+	return cancel, true
+}
+
 type Service struct {
 	executor         Executor
 	lifecycleManager LifecycleManager
+	activeExecutions *activeExecutions
 }
 
 func New(
@@ -45,6 +101,7 @@ func New(
 	return &Service{
 		executor:         executor,
 		lifecycleManager: lifecycleManager,
+		activeExecutions: newActiveExecutions(),
 	}, nil
 }
 
@@ -81,6 +138,30 @@ func (s *Service) StartWithCompletion(
 	return s.start(executionID, scenario, timeout, onCompletion)
 }
 
+func (s *Service) Cancel(executionID string) error {
+	if executionID == "" {
+		return ErrExecutionNotFound
+	}
+
+	snapshot, ok := s.lifecycleManager.Get(executionID)
+	if !ok {
+		return ErrExecutionNotFound
+	}
+	if snapshot.Status == lifecycle.StatusCompleted ||
+		snapshot.Status == lifecycle.StatusFailed ||
+		snapshot.Status == lifecycle.StatusCancelled {
+		return ErrExecutionNotActive
+	}
+
+	cancel, ok := s.activeExecutions.cancel(executionID)
+	if !ok || cancel == nil {
+		return ErrExecutionNotActive
+	}
+
+	cancel()
+	return nil
+}
+
 func (s *Service) start(
 	executionID string,
 	scenario demo.Scenario,
@@ -100,12 +181,23 @@ func (s *Service) start(
 	}
 
 	executionCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	s.activeExecutions.register(executionID, cancel)
+
 	go func() {
-		defer cancel()
-		if onCompletion != nil {
-			defer onCompletion()
-		}
-		_, _ = s.executeAndRecord(executionCtx, executionID, scenario)
+		defer func() {
+			s.activeExecutions.remove(executionID)
+			cancel()
+
+			if onCompletion != nil {
+				onCompletion()
+			}
+		}()
+
+		_, _ = s.executeAndRecord(
+			executionCtx,
+			executionID,
+			scenario,
+		)
 	}()
 
 	return nil
