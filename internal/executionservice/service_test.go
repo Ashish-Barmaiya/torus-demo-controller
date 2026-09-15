@@ -1020,6 +1020,43 @@ func TestStartPublishesLifecycleEventsToHub(t *testing.T) {
 	}
 }
 
+func TestStartSubscriberAfterStartedReplaysEarlierLifecycleEvents(t *testing.T) {
+	manager := testManager(t)
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		result:  execution.Result{ExecutionID: "exec_1"},
+	}
+	hub := event.NewHub(8)
+	service, err := New(executor, manager, hub)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	<-executor.started
+
+	subscription, err := hub.Subscribe("exec_1")
+	if err != nil {
+		t.Fatalf("Subscribe() error: %v", err)
+	}
+	defer subscription.Close()
+	close(executor.release)
+
+	want := []event.EventType{event.EventCreated, event.EventStarted, event.EventCompleted}
+	for index, wantType := range want {
+		got := receiveEvent(t, subscription)
+		if got.Type != wantType {
+			t.Fatalf("event[%d].Type = %q, want %q", index, got.Type, wantType)
+		}
+		if got.Sequence != uint64(index+1) {
+			t.Fatalf("event[%d].Sequence = %d, want %d", index, got.Sequence, index+1)
+		}
+	}
+}
+
 func TestCancelPublishesTerminalEventToHub(t *testing.T) {
 	manager := testManager(t)
 	executor := &fakeExecutor{

@@ -3,6 +3,7 @@ package event
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -201,7 +202,7 @@ func TestHubSupportsMultipleSubscribersAndNoSubscribers(t *testing.T) {
 	}
 }
 
-func TestHubDoesNotReplayAndCloseIsIdempotent(t *testing.T) {
+func TestHubReplaysHistoryAndCloseIsIdempotent(t *testing.T) {
 	hub := NewHub(2)
 	eventBeforeSubscribe := Event{Sequence: 1, ExecutionID: "exec_1"}
 	if err := hub.Publish(eventBeforeSubscribe); err != nil {
@@ -209,6 +210,9 @@ func TestHubDoesNotReplayAndCloseIsIdempotent(t *testing.T) {
 	}
 
 	subscription, _ := hub.Subscribe("exec_1")
+	if got := <-subscription.Events(); got != eventBeforeSubscribe {
+		t.Fatalf("replayed event = %+v, want %+v", got, eventBeforeSubscribe)
+	}
 	subscription.Close()
 	subscription.Close()
 	if _, ok := <-subscription.Events(); ok {
@@ -331,6 +335,170 @@ func TestHubSupportsConcurrentSubscriptions(t *testing.T) {
 		t.Fatalf("subscriber count = %d, want %d", len(hub.subscribers["exec_1"]), subscriptionCount)
 	}
 	for _, subscription := range subscriptions {
+		subscription.Close()
+	}
+}
+
+func TestHubRetainsOnlyMostRecentHistory(t *testing.T) {
+	hub := NewHub(DefaultSubscriberBufferSize)
+	for sequence := uint64(1); sequence <= DefaultHistorySize+4; sequence++ {
+		if err := hub.Publish(Event{Sequence: sequence, ExecutionID: "exec_1"}); err != nil {
+			t.Fatalf("Publish() error: %v", err)
+		}
+	}
+
+	subscription, _ := hub.Subscribe("exec_1")
+	defer subscription.Close()
+	for sequence := uint64(5); sequence <= DefaultHistorySize+4; sequence++ {
+		if got := <-subscription.Events(); got.Sequence != sequence {
+			t.Fatalf("replayed sequence = %d, want %d", got.Sequence, sequence)
+		}
+	}
+}
+
+func TestHubUnknownExecutionReceivesFutureEvents(t *testing.T) {
+	hub := NewHub(2)
+	subscription, err := hub.Subscribe("future")
+	if err != nil {
+		t.Fatalf("Subscribe() error: %v", err)
+	}
+	defer subscription.Close()
+
+	want := Event{Sequence: 1, ExecutionID: "future"}
+	if err := hub.Publish(want); err != nil {
+		t.Fatalf("Publish() error: %v", err)
+	}
+	if got := <-subscription.Events(); got != want {
+		t.Fatalf("future event = %+v, want %+v", got, want)
+	}
+}
+
+func TestHubReplaysThenDeliversLiveEventExactlyOnce(t *testing.T) {
+	hub := NewHub(4)
+	history := []Event{
+		{Sequence: 1, ExecutionID: "exec_1", Type: EventCreated},
+		{Sequence: 2, ExecutionID: "exec_1", Type: EventStarted},
+	}
+	for _, evt := range history {
+		_ = hub.Publish(evt)
+	}
+
+	subscription, _ := hub.Subscribe("exec_1")
+	defer subscription.Close()
+	live := Event{Sequence: 3, ExecutionID: "exec_1", Type: EventCompleted}
+	_ = hub.Publish(live)
+
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		if got := <-subscription.Events(); got.Sequence != sequence {
+			t.Fatalf("sequence = %d, want %d", got.Sequence, sequence)
+		}
+	}
+	select {
+	case got := <-subscription.Events():
+		t.Fatalf("duplicate event = %+v", got)
+	default:
+	}
+}
+
+func TestHubMultipleSubscribersReplayAndReceiveFutureEvents(t *testing.T) {
+	hub := NewHub(4)
+	_ = hub.Publish(Event{Sequence: 1, ExecutionID: "exec_1"})
+	first, _ := hub.Subscribe("exec_1")
+	second, _ := hub.Subscribe("exec_1")
+	defer first.Close()
+	defer second.Close()
+	_ = hub.Publish(Event{Sequence: 2, ExecutionID: "exec_1"})
+
+	for name, subscription := range map[string]*Subscription{"first": first, "second": second} {
+		for sequence := uint64(1); sequence <= 2; sequence++ {
+			if got := <-subscription.Events(); got.Sequence != sequence {
+				t.Fatalf("%s sequence = %d, want %d", name, got.Sequence, sequence)
+			}
+		}
+	}
+}
+
+func TestHubIsolatesHistoryByExecution(t *testing.T) {
+	hub := NewHub(2)
+	_ = hub.Publish(Event{Sequence: 1, ExecutionID: "exec_1"})
+	_ = hub.Publish(Event{Sequence: 1, ExecutionID: "exec_2"})
+
+	first, _ := hub.Subscribe("exec_1")
+	second, _ := hub.Subscribe("exec_2")
+	defer first.Close()
+	defer second.Close()
+	if got := <-first.Events(); got.ExecutionID != "exec_1" {
+		t.Fatalf("first execution = %q, want exec_1", got.ExecutionID)
+	}
+	if got := <-second.Events(); got.ExecutionID != "exec_2" {
+		t.Fatalf("second execution = %q, want exec_2", got.ExecutionID)
+	}
+}
+
+func TestHubEvictsOldestExecutionHistory(t *testing.T) {
+	hub := NewHub(1)
+	for index := 0; index < MaxRetainedExecutions; index++ {
+		_ = hub.Publish(Event{Sequence: 1, ExecutionID: fmt.Sprintf("exec_%d", index)})
+	}
+	_ = hub.Publish(Event{Sequence: 1, ExecutionID: "newest"})
+
+	if _, exists := hub.history["exec_0"]; exists {
+		t.Fatal("oldest execution history was not evicted")
+	}
+	if _, exists := hub.history["exec_1"]; !exists {
+		t.Fatal("newer execution history was evicted")
+	}
+	subscription, _ := hub.Subscribe("newest")
+	defer subscription.Close()
+	if got := <-subscription.Events(); got.ExecutionID != "newest" {
+		t.Fatalf("replayed execution = %q, want newest", got.ExecutionID)
+	}
+}
+
+func TestHubReplaysTerminalExecution(t *testing.T) {
+	hub := NewHub(3)
+	for sequence, eventType := range []EventType{EventCreated, EventStarted, EventCompleted} {
+		_ = hub.Publish(Event{Sequence: uint64(sequence + 1), ExecutionID: "exec_1", Type: eventType})
+	}
+	subscription, _ := hub.Subscribe("exec_1")
+	defer subscription.Close()
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		if got := <-subscription.Events(); got.Sequence != sequence {
+			t.Fatalf("terminal replay sequence = %d, want %d", got.Sequence, sequence)
+		}
+	}
+}
+
+func TestHubSubscribePublishBoundaryDoesNotLoseOrDuplicateEvents(t *testing.T) {
+	const attempts = 25
+	for attempt := 0; attempt < attempts; attempt++ {
+		hub := NewHub(3)
+		_ = hub.Publish(Event{Sequence: 1, ExecutionID: "exec_1"})
+
+		start := make(chan struct{})
+		subscriptions := make(chan *Subscription, 1)
+		go func() {
+			<-start
+			subscription, _ := hub.Subscribe("exec_1")
+			subscriptions <- subscription
+		}()
+		go func() {
+			<-start
+			_ = hub.Publish(Event{Sequence: 2, ExecutionID: "exec_1"})
+		}()
+		close(start)
+		subscription := <-subscriptions
+		_ = hub.Publish(Event{Sequence: 3, ExecutionID: "exec_1"})
+
+		seen := make(map[uint64]int)
+		for len(seen) < 3 {
+			seen[(<-subscription.Events()).Sequence]++
+		}
+		for sequence := uint64(1); sequence <= 3; sequence++ {
+			if seen[sequence] != 1 {
+				t.Fatalf("sequence %d seen %d times", sequence, seen[sequence])
+			}
+		}
 		subscription.Close()
 	}
 }

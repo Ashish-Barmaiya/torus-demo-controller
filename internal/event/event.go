@@ -27,14 +27,23 @@ type Publisher interface {
 	Publish(Event) error
 }
 
-const defaultHubBufferSize = 16
+const (
+	DefaultSubscriberBufferSize = 16
+	DefaultHistorySize          = 16
+	MaxRetainedExecutions       = 100
+)
 
 var errEmptyExecutionID = errors.New("execution ID must not be empty")
 
 type Hub struct {
 	mu          sync.Mutex
 	subscribers map[string]map[*Subscription]struct{}
-	bufferSize  int
+	// History is process-local and bounded; restart intentionally loses it.
+	history               map[string][]Event
+	historyOrder          []string
+	bufferSize            int
+	historySize           int
+	maxRetainedExecutions int
 }
 
 type Subscription struct {
@@ -49,12 +58,15 @@ var _ Publisher = (*Hub)(nil)
 
 func NewHub(bufferSize int) *Hub {
 	if bufferSize <= 0 {
-		bufferSize = defaultHubBufferSize
+		bufferSize = DefaultSubscriberBufferSize
 	}
 
 	return &Hub{
-		subscribers: make(map[string]map[*Subscription]struct{}),
-		bufferSize:  bufferSize,
+		subscribers:           make(map[string]map[*Subscription]struct{}),
+		history:               make(map[string][]Event),
+		historySize:           DefaultHistorySize,
+		maxRetainedExecutions: MaxRetainedExecutions,
+		bufferSize:            bufferSize,
 	}
 }
 
@@ -72,6 +84,15 @@ func (h *Hub) Subscribe(executionID string) (*Subscription, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+replay:
+	for _, historicalEvent := range h.history[executionID] {
+		select {
+		case subscription.events <- historicalEvent:
+		default:
+			break replay
+		}
+	}
+
 	if h.subscribers[executionID] == nil {
 		h.subscribers[executionID] = make(map[*Subscription]struct{})
 	}
@@ -86,25 +107,39 @@ func (h *Hub) Publish(evt Event) error {
 	}
 
 	h.mu.Lock()
-	subscribers := make([]*Subscription, 0, len(h.subscribers[evt.ExecutionID]))
-	for subscription := range h.subscribers[evt.ExecutionID] {
-		subscribers = append(subscribers, subscription)
-	}
-	h.mu.Unlock()
+	defer h.mu.Unlock()
 
-	for _, subscription := range subscribers {
+	h.retain(evt)
+	for subscription := range h.subscribers[evt.ExecutionID] {
 		subscription.mu.Lock()
 		if !subscription.closed {
 			select {
 			case subscription.events <- evt:
 			default:
-				// Drop newest events when a consumer buffer is full until replay exists.
+				// Drop newest events when a consumer buffer is full.
 			}
 		}
 		subscription.mu.Unlock()
 	}
 
 	return nil
+}
+
+func (h *Hub) retain(evt Event) {
+	if _, exists := h.history[evt.ExecutionID]; !exists {
+		if len(h.historyOrder) >= h.maxRetainedExecutions {
+			oldestExecutionID := h.historyOrder[0]
+			delete(h.history, oldestExecutionID)
+			h.historyOrder = h.historyOrder[1:]
+		}
+		h.historyOrder = append(h.historyOrder, evt.ExecutionID)
+	}
+
+	history := append(h.history[evt.ExecutionID], evt)
+	if len(history) > h.historySize {
+		history = history[len(history)-h.historySize:]
+	}
+	h.history[evt.ExecutionID] = history
 }
 
 func (s *Subscription) Events() <-chan Event {
