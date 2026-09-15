@@ -26,6 +26,8 @@ const shutdownTimeout = 5 * time.Second
 
 const maxRetainedExecutions = 100
 
+const eventBufferSize = 16
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -63,12 +65,12 @@ func main() {
 		log.Fatalf("create lifecycle manager: %v", err)
 	}
 
-	eventPublisher := event.NoopPublisher{}
+	eventHub := event.NewHub(eventBufferSize)
 
 	executionService, err := executionservice.New(
 		executor,
 		lifecycleManager,
-		eventPublisher,
+		eventHub,
 	)
 	if err != nil {
 		log.Fatalf("create execution service: %v", err)

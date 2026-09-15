@@ -983,6 +983,79 @@ func TestStartPublishesLifecycleEvents(t *testing.T) {
 	}
 }
 
+func TestStartPublishesLifecycleEventsToHub(t *testing.T) {
+	manager := testManager(t)
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		result:  execution.Result{ExecutionID: "exec_1"},
+	}
+	hub := event.NewHub(8)
+	subscription, err := hub.Subscribe("exec_1")
+	if err != nil {
+		t.Fatalf("Subscribe() error: %v", err)
+	}
+	defer subscription.Close()
+
+	service, err := New(executor, manager, hub)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	<-executor.started
+	close(executor.release)
+
+	want := []event.EventType{event.EventCreated, event.EventStarted, event.EventCompleted}
+	for index, wantType := range want {
+		got := receiveEvent(t, subscription)
+		if got.Type != wantType {
+			t.Fatalf("event[%d].Type = %q, want %q", index, got.Type, wantType)
+		}
+		if got.Sequence != uint64(index+1) {
+			t.Fatalf("event[%d].Sequence = %d, want %d", index, got.Sequence, index+1)
+		}
+	}
+}
+
+func TestCancelPublishesTerminalEventToHub(t *testing.T) {
+	manager := testManager(t)
+	executor := &fakeExecutor{
+		block:   true,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	hub := event.NewHub(8)
+	subscription, err := hub.Subscribe("exec_1")
+	if err != nil {
+		t.Fatalf("Subscribe() error: %v", err)
+	}
+	defer subscription.Close()
+
+	service, err := New(executor, manager, hub)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if err := service.Start("exec_1", testScenario(), time.Second); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	<-executor.started
+	for _, wantType := range []event.EventType{event.EventCreated, event.EventStarted} {
+		if got := receiveEvent(t, subscription); got.Type != wantType {
+			t.Fatalf("event type = %q, want %q", got.Type, wantType)
+		}
+	}
+
+	if err := service.Cancel("exec_1"); err != nil {
+		t.Fatalf("Cancel() error: %v", err)
+	}
+	if got := receiveEvent(t, subscription); got.Type != event.EventCancelled {
+		t.Fatalf("terminal event type = %q, want %q", got.Type, event.EventCancelled)
+	}
+}
+
 func TestPublisherFailureDoesNotCorruptExecution(t *testing.T) {
 	manager := testManager(t)
 	executor := &fakeExecutor{result: execution.Result{ExecutionID: "exec_1"}}
@@ -1013,6 +1086,17 @@ func executorStarted(executor *fakeExecutor) <-chan struct{} {
 		return nil
 	}
 	return executor.started
+}
+
+func receiveEvent(t *testing.T, subscription *event.Subscription) event.Event {
+	t.Helper()
+	select {
+	case evt := <-subscription.Events():
+		return evt
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event")
+		return event.Event{}
+	}
 }
 
 func contains(value, fragment string) bool {
