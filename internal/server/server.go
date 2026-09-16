@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/demo"
+	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/event"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/execution"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/executionservice"
 	"github.com/Ashish-Barmaiya/torus-demo-controller/internal/identity"
@@ -56,6 +57,7 @@ type Server struct {
 	manager          *lifecycle.Manager
 	policy           policy.Policy
 	limiter          *ratelimit.Limiter
+	eventHub         *event.Hub
 }
 
 type ExecutionStarter interface {
@@ -73,6 +75,7 @@ func New(
 	executionPolicy policy.Policy,
 	limiter *ratelimit.Limiter,
 	manager *lifecycle.Manager,
+	hubs ...*event.Hub,
 ) (*Server, error) {
 	if executionService == nil {
 		return nil, fmt.Errorf("execution service must not be nil")
@@ -84,18 +87,23 @@ func New(
 		return nil, fmt.Errorf("lifecycle manager must not be nil")
 	}
 
-	return &Server{
+	server := &Server{
 		executionService: executionService,
 		manager:          manager,
 		policy:           executionPolicy,
 		limiter:          limiter,
-	}, nil
+	}
+	if len(hubs) > 0 && hubs[0] != nil {
+		server.eventHub = hubs[0]
+	}
+	return server, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/api/v1/run", s.handleRun)
 	mux.HandleFunc("/api/v1/executions/", s.handleExecution)
 	mux.HandleFunc("/api/v1/executions", s.handleExecution)
