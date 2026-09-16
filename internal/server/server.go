@@ -60,6 +60,12 @@ type Server struct {
 	eventHub         *event.Hub
 }
 
+const (
+	allowedCORSOrigin  = "http://localhost:3000"
+	allowedCORSMethods = "GET, POST, OPTIONS"
+	allowedCORSHeaders = "Content-Type"
+)
+
 type ExecutionStarter interface {
 	StartWithCompletion(
 		string,
@@ -108,7 +114,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/executions/", s.handleExecution)
 	mux.HandleFunc("/api/v1/executions", s.handleExecution)
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isAPIPath(r.URL.Path) || r.Header.Get("Origin") != allowedCORSOrigin {
+			mux.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", allowedCORSOrigin)
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", allowedCORSMethods)
+			w.Header().Set("Access-Control-Allow-Headers", allowedCORSHeaders)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func isAPIPath(path string) bool {
+	return path == "/api/v1" || strings.HasPrefix(path, "/api/v1/")
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

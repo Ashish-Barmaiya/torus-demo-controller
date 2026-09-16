@@ -619,6 +619,82 @@ func TestServerValidationAndMethodErrors(t *testing.T) {
 	}
 }
 
+func TestServerCORSPreflight(t *testing.T) {
+	server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+
+	for _, path := range []string{
+		"/api/v1/run",
+		"/api/v1/executions/exec_1",
+		"/api/v1/executions/exec_1/cancel",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodOptions, path, nil)
+			req.Header.Set("Origin", allowedCORSOrigin)
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, req)
+
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Origin"); got != allowedCORSOrigin {
+				t.Fatalf("allow-origin = %q, want %q", got, allowedCORSOrigin)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Methods"); got != allowedCORSMethods {
+				t.Fatalf("allow-methods = %q, want %q", got, allowedCORSMethods)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Headers"); got != allowedCORSHeaders {
+				t.Fatalf("allow-headers = %q, want %q", got, allowedCORSHeaders)
+			}
+		})
+	}
+}
+
+func TestServerCORSDisallowedPreflightFallsThrough(t *testing.T) {
+	server, _, _ := newTestServer(t, &fakeExecutor{}, policy.Default(), ratelimit.NewDefault())
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/run", nil)
+	req.Header.Set("Origin", "http://evil.example")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, req)
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("allow-origin = %q, want empty", got)
+	}
+	assertRecorderAPIError(t, response, ErrorCodeMethodNotAllowed, "method not allowed")
+}
+
+func TestServerCORSAllowedPostPreservesRunResponse(t *testing.T) {
+	executor := &fakeExecutor{finished: make(chan struct{})}
+	server, _, observer := newTestServer(t, executor, policy.Default(), ratelimit.NewDefault())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/run", strings.NewReader(validRequestBody()))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", allowedCORSOrigin)
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, req)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != allowedCORSOrigin {
+		t.Fatalf("allow-origin = %q, want %q", got, allowedCORSOrigin)
+	}
+	var payload startResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.ExecutionID == "" {
+		t.Fatal("execution_id is empty")
+	}
+	<-executor.finished
+	waitForLifecycle(t, observer)
+}
+
 func newTestServer(t *testing.T, executor executionservice.Executor, executionPolicy policy.Policy, limiter *ratelimit.Limiter) (*Server, *lifecycle.Manager, *observedLifecycle) {
 	t.Helper()
 	manager, err := lifecycle.New(10)
